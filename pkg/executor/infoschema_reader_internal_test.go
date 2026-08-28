@@ -18,13 +18,17 @@ import (
 	"context"
 	"testing"
 
+	"github.com/pingcap/tidb/pkg/expression"
 	"github.com/pingcap/tidb/pkg/infoschema"
+	"github.com/pingcap/tidb/pkg/meta/metadef"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
+	"github.com/pingcap/tidb/pkg/planner/core/operator/physicalop"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/memory"
+	"github.com/pingcap/tidb/pkg/util/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -63,6 +67,20 @@ func (i *mockTableInfoIterator) RetainedMemory() int64 {
 		return 0
 	}
 	return i.retainedBytes
+}
+
+func TestInfoSchemaColumnsUsesHugeRetriever(t *testing.T) {
+	sctx := mock.NewContext()
+	is := infoschema.MockInfoSchema(nil)
+	builder := NewMockExecutorBuilderForTest(sctx, is, nil)
+	plan := physicalop.PhysicalMemTable{
+		DBName:    metadef.InformationSchemaName,
+		Table:     &model.TableInfo{Name: ast.NewCIStr(infoschema.TableColumns)},
+		Extractor: plannercore.NewInfoSchemaColumnsExtractor(),
+	}.Init(sctx, nil, 0)
+	plan.SetSchema(expression.NewSchema())
+	reader := builder.Build(plan).(*MemTableReaderExec)
+	require.IsType(t, &hugeMemTableRetriever{}, reader.retriever)
 }
 
 func TestHugeMemTableRetrieverKeepsTableInfoIteratorAcrossBatches(t *testing.T) {

@@ -52,6 +52,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/charset"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	field_types "github.com/pingcap/tidb/pkg/parser/types"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/privilege"
@@ -1030,7 +1031,6 @@ type hugeMemTableRetriever struct {
 	columns            []*model.ColumnInfo
 	retrieved          bool
 	initialized        bool
-	rows               [][]types.Datum
 	dbs                []ast.CIStr
 	curTables          []*model.TableInfo
 	curTablesLoaded    bool
@@ -1041,6 +1041,7 @@ type hugeMemTableRetriever struct {
 	viewOutputNamesMap map[int64]types.NameSlice    // table id to view output names
 	batch              int
 	is                 infoschema.InfoSchema
+	rowBuffer          *boundedDatumRows
 	tableInfoBatch     *boundedTableInfoBatch
 	memTracker         *memory.Tracker
 	newTableInfoIter   func(context.Context, ast.CIStr, int64) (infoschema.TableInfoIterator, error)
@@ -1057,6 +1058,12 @@ func (e *hugeMemTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Co
 	if !e.initialized {
 		e.is = sessiontxn.GetTxnManager(sctx).GetTxnInfoSchema()
 		e.dbs = e.extractor.ListSchemas(e.is)
+		e.rowBuffer = newBoundedDatumRows(
+			e.table,
+			e.columns,
+			e.memTracker,
+			hugeMemTableRetainedCapacityLimit,
+		)
 		if e.tableInfoBatch == nil {
 			e.tableInfoBatch = newBoundedTableInfoBatch(e.memTracker, hugeMemTableRetainedCapacityLimit)
 		}
@@ -1068,9 +1075,9 @@ func (e *hugeMemTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Co
 			e.newTableInfoIter = v2.NewTableInfoIterator
 		}
 		e.initialized = true
-		e.rows = make([][]types.Datum, 0, hugeMemTableBatchSize)
 		e.batch = hugeMemTableBatchSize
 	}
+	e.rowBuffer.beginBatch()
 	e.tableInfoBatch.beginBatch()
 
 	err := e.setDataForColumns(ctx, sctx)
@@ -1079,11 +1086,16 @@ func (e *hugeMemTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Co
 		return nil, err
 	}
 	e.tableInfoBatch.finishBatch()
-	e.retrieved = len(e.rows) == 0
-	return adjustColumns(e.rows, e.columns, e.table), nil
+	rows := e.rowBuffer.rows()
+	e.retrieved = len(rows) == 0
+	return rows, nil
 }
 
 func (e *hugeMemTableRetriever) close() error {
+	if e.rowBuffer != nil {
+		e.rowBuffer.close()
+		e.rowBuffer = nil
+	}
 	if e.tableInfoBatch != nil {
 		e.tableInfoBatch.close()
 		e.tableInfoBatch = nil
@@ -1198,11 +1210,10 @@ func (e *hugeMemTableRetriever) iterateTables(
 
 func (e *hugeMemTableRetriever) setDataForColumns(ctx context.Context, sctx sessionctx.Context) error {
 	checker := privilege.GetPrivilegeManager(sctx)
-	e.rows = e.rows[:0]
 	return e.iterateTables(ctx, func(schema ast.CIStr, table *model.TableInfo) (bool, bool) {
-		rowsBefore := len(e.rows)
+		rowsBefore := e.rowBuffer.len()
 		continueIteration := e.setDataForColumnsWithOneTable(ctx, sctx, schema, table, checker)
-		return continueIteration, len(e.rows) > rowsBefore
+		return continueIteration, e.rowBuffer.len() > rowsBefore
 	})
 }
 
@@ -1228,7 +1239,7 @@ func (e *hugeMemTableRetriever) setDataForColumnsWithOneTable(
 	}
 
 	e.dataForColumnsInTable(ctx, sctx, schema, table, priv)
-	return len(e.rows) < e.batch
+	return e.rowBuffer.len() < e.batch
 }
 
 // Ref link https://github.com/mysql/mysql-server/blob/6b6d3ed3d5c6591b446276184642d7d0504ecc86/sql/dd/dd_table.cc#L411
@@ -1255,6 +1266,54 @@ func getNumericPrecision(ft *types.FieldType, colLen int) int {
 		return colLen
 	}
 	return 0
+}
+
+func infoSchemaColumnDefault(sctx sessionctx.Context, col *model.ColumnInfo, ft *types.FieldType) (string, bool) {
+	if mysql.HasNoDefaultValueFlag(col.GetFlag()) {
+		return "", false
+	}
+	defaultValue := col.GetDefaultValue()
+	if defaultValStr, ok := defaultValue.(string); ok &&
+		(col.GetType() == mysql.TypeTimestamp || col.GetType() == mysql.TypeDatetime) &&
+		strings.EqualFold(defaultValStr, ast.CurrentTimestamp) && col.GetDecimal() > 0 {
+		defaultValue = fmt.Sprintf("%s(%d)", defaultValStr, col.GetDecimal())
+	}
+	if defaultValue == nil {
+		return "", false
+	}
+	columnDefault := fmt.Sprintf("%v", defaultValue)
+	switch col.GetDefaultValue() {
+	case "CURRENT_TIMESTAMP":
+	default:
+		if ft.GetType() == mysql.TypeTimestamp && columnDefault != types.ZeroDatetimeStr {
+			timeValue, err := table.GetColDefaultValue(sctx.GetExprCtx(), col)
+			if err == nil {
+				columnDefault = timeValue.GetMysqlTime().String()
+			}
+		}
+		if ft.GetType() == mysql.TypeBit && !col.DefaultIsExpr {
+			defaultValBinaryLiteral := types.BinaryLiteral(columnDefault)
+			columnDefault = defaultValBinaryLiteral.ToBitLiteralString(true)
+		}
+	}
+	return columnDefault, true
+}
+
+func infoSchemaColumnExtra(col *model.ColumnInfo) string {
+	switch {
+	case mysql.HasAutoIncrementFlag(col.GetFlag()):
+		return "auto_increment"
+	case mysql.HasOnUpdateNowFlag(col.GetFlag()):
+		return "DEFAULT_GENERATED on update CURRENT_TIMESTAMP" + table.OptionalFsp(&col.FieldType)
+	case col.IsGenerated() && col.GeneratedStored:
+		return "STORED GENERATED"
+	case col.IsGenerated():
+		return "VIRTUAL GENERATED"
+	case col.DefaultIsExpr:
+		return "DEFAULT_GENERATED"
+	default:
+		return ""
+	}
 }
 
 func (e *hugeMemTableRetriever) dataForColumnsInTable(
@@ -1288,8 +1347,19 @@ func (e *hugeMemTableRetriever) dataForColumnsInTable(
 		e.viewMu.Unlock()
 	}
 
-	cols, ordinalPos := e.extractor.ListColumns(tbl)
-	for i, col := range cols {
+	var columnPrivileges string
+	if e.rowBuffer.projects(18) {
+		columnPrivileges = strings.ToLower(privileges.PrivToString(priv, mysql.AllColumnPrivs, mysql.Priv2Str))
+	}
+	ordinalPos := 0
+	for _, col := range tbl.Columns {
+		if col.Hidden {
+			continue
+		}
+		ordinalPos++
+		if !e.extractor.ColumnMatches(col.Name) {
+			continue
+		}
 		// Skip non-public columns
 		if col.State != model.StatePublic {
 			continue
@@ -1309,104 +1379,172 @@ func (e *hugeMemTableRetriever) dataForColumnsInTable(
 			e.viewMu.RUnlock()
 		}
 
-		var charMaxLen, charOctLen, numericPrecision, numericScale, datetimePrecision any
-		colLen, decimal := ft.GetFlen(), ft.GetDecimal()
-		defaultFlen, defaultDecimal := mysql.GetDefaultFieldLengthAndDecimal(ft.GetType())
-		if decimal == types.UnspecifiedLength {
-			decimal = defaultDecimal
-		}
-		if colLen == types.UnspecifiedLength {
-			colLen = defaultFlen
-		}
-		if ft.GetType() == mysql.TypeSet {
-			// Example: In MySQL set('a','bc','def','ghij') has length 13, because
-			// len('a')+len('bc')+len('def')+len('ghij')+len(ThreeComma)=13
-			// Reference link: https://bugs.mysql.com/bug.php?id=22613
-			colLen = 0
-			for _, ele := range ft.GetElems() {
-				colLen += len(ele)
+		var charMaxLen, charOctLen, numericPrecision, numericScale, datetimePrecision int
+		var hasCharMaxLen, hasCharOctLen, hasNumericPrecision, hasNumericScale, hasDatetimePrecision bool
+		if e.rowBuffer.projects(8) || e.rowBuffer.projects(9) || e.rowBuffer.projects(10) || e.rowBuffer.projects(11) || e.rowBuffer.projects(12) {
+			colLen, decimal := ft.GetFlen(), ft.GetDecimal()
+			defaultFlen, defaultDecimal := mysql.GetDefaultFieldLengthAndDecimal(ft.GetType())
+			if decimal == types.UnspecifiedLength {
+				decimal = defaultDecimal
 			}
-			if len(ft.GetElems()) != 0 {
-				colLen += (len(ft.GetElems()) - 1)
+			if colLen == types.UnspecifiedLength {
+				colLen = defaultFlen
 			}
-			charMaxLen = colLen
-			charOctLen = calcCharOctLength(colLen, ft.GetCharset())
-		} else if ft.GetType() == mysql.TypeEnum {
-			// Example: In MySQL enum('a', 'ab', 'cdef') has length 4, because
-			// the longest string in the enum is 'cdef'
-			// Reference link: https://bugs.mysql.com/bug.php?id=22613
-			colLen = 0
-			for _, ele := range ft.GetElems() {
-				if len(ele) > colLen {
-					colLen = len(ele)
+			if ft.GetType() == mysql.TypeSet {
+				colLen = 0
+				for _, ele := range ft.GetElems() {
+					colLen += len(ele)
 				}
-			}
-			charMaxLen = colLen
-			charOctLen = calcCharOctLength(colLen, ft.GetCharset())
-		} else if types.IsString(ft.GetType()) {
-			charMaxLen = colLen
-			charOctLen = calcCharOctLength(colLen, ft.GetCharset())
-		} else if types.IsTypeFractionable(ft.GetType()) {
-			datetimePrecision = decimal
-		} else if types.IsTypeNumeric(ft.GetType()) {
-			numericPrecision = getNumericPrecision(ft, colLen)
-			if ft.GetType() != mysql.TypeFloat && ft.GetType() != mysql.TypeDouble {
-				numericScale = decimal
-			} else if decimal != -1 {
-				numericScale = decimal
-			}
-		} else if ft.GetType() == mysql.TypeNull {
-			charMaxLen, charOctLen = 0, 0
-		}
-		columnType := ft.InfoSchemaStr()
-		columnDesc := table.NewColDesc(table.ToColumn(col))
-		var columnDefault any
-		if columnDesc.DefaultValue != nil {
-			columnDefault = fmt.Sprintf("%v", columnDesc.DefaultValue)
-			switch col.GetDefaultValue() {
-			case "CURRENT_TIMESTAMP":
-			default:
-				if ft.GetType() == mysql.TypeTimestamp && columnDefault != types.ZeroDatetimeStr {
-					timeValue, err := table.GetColDefaultValue(sctx.GetExprCtx(), col)
-					if err == nil {
-						columnDefault = timeValue.GetMysqlTime().String()
+				if len(ft.GetElems()) != 0 {
+					colLen += len(ft.GetElems()) - 1
+				}
+				if e.rowBuffer.projects(8) {
+					charMaxLen = colLen
+					hasCharMaxLen = true
+				}
+				if e.rowBuffer.projects(9) {
+					charOctLen = calcCharOctLength(colLen, ft.GetCharset())
+					hasCharOctLen = true
+				}
+			} else if ft.GetType() == mysql.TypeEnum {
+				colLen = 0
+				for _, ele := range ft.GetElems() {
+					if len(ele) > colLen {
+						colLen = len(ele)
 					}
 				}
-				if ft.GetType() == mysql.TypeBit && !col.DefaultIsExpr {
-					defaultValBinaryLiteral := types.BinaryLiteral(columnDefault.(string))
-					columnDefault = defaultValBinaryLiteral.ToBitLiteralString(true)
+				if e.rowBuffer.projects(8) {
+					charMaxLen = colLen
+					hasCharMaxLen = true
+				}
+				if e.rowBuffer.projects(9) {
+					charOctLen = calcCharOctLength(colLen, ft.GetCharset())
+					hasCharOctLen = true
+				}
+			} else if types.IsString(ft.GetType()) {
+				if e.rowBuffer.projects(8) {
+					charMaxLen = colLen
+					hasCharMaxLen = true
+				}
+				if e.rowBuffer.projects(9) {
+					charOctLen = calcCharOctLength(colLen, ft.GetCharset())
+					hasCharOctLen = true
+				}
+			} else if types.IsTypeFractionable(ft.GetType()) {
+				if e.rowBuffer.projects(12) {
+					datetimePrecision = decimal
+					hasDatetimePrecision = true
+				}
+			} else if types.IsTypeNumeric(ft.GetType()) {
+				if e.rowBuffer.projects(10) {
+					numericPrecision = getNumericPrecision(ft, colLen)
+					hasNumericPrecision = true
+				}
+				if e.rowBuffer.projects(11) && (ft.GetType() != mysql.TypeFloat && ft.GetType() != mysql.TypeDouble || decimal != -1) {
+					numericScale = decimal
+					hasNumericScale = true
+				}
+			} else if ft.GetType() == mysql.TypeNull {
+				if e.rowBuffer.projects(8) {
+					charMaxLen = 0
+					hasCharMaxLen = true
+				}
+				if e.rowBuffer.projects(9) {
+					charOctLen = 0
+					hasCharOctLen = true
 				}
 			}
 		}
-		colType := ft.GetType()
-		if colType == mysql.TypeVarString {
-			colType = mysql.TypeVarchar
+
+		var dataType, columnType string
+		if e.rowBuffer.projects(7) {
+			colType := ft.GetType()
+			if colType == mysql.TypeVarString {
+				colType = mysql.TypeVarchar
+			}
+			dataType = types.TypeToStr(colType, ft.GetCharset())
 		}
-		record := types.MakeDatums(
-			infoschema.CatalogVal, // TABLE_CATALOG
-			schema.O,              // TABLE_SCHEMA
-			tbl.Name.O,            // TABLE_NAME
-			col.Name.O,            // COLUMN_NAME
-			ordinalPos[i],         // ORDINAL_POSITION
-			columnDefault,         // COLUMN_DEFAULT
-			columnDesc.Null,       // IS_NULLABLE
-			types.TypeToStr(colType, ft.GetCharset()), // DATA_TYPE
-			charMaxLen,           // CHARACTER_MAXIMUM_LENGTH
-			charOctLen,           // CHARACTER_OCTET_LENGTH
-			numericPrecision,     // NUMERIC_PRECISION
-			numericScale,         // NUMERIC_SCALE
-			datetimePrecision,    // DATETIME_PRECISION
-			columnDesc.Charset,   // CHARACTER_SET_NAME
-			columnDesc.Collation, // COLLATION_NAME
-			columnType,           // COLUMN_TYPE
-			columnDesc.Key,       // COLUMN_KEY
-			columnDesc.Extra,     // EXTRA
-			strings.ToLower(privileges.PrivToString(priv, mysql.AllColumnPrivs, mysql.Priv2Str)), // PRIVILEGES
-			columnDesc.Comment,      // COLUMN_COMMENT
-			col.GeneratedExprString, // GENERATION_EXPRESSION
-			nil,                     // SRS_ID
-		)
-		e.rows = append(e.rows, record)
+		if e.rowBuffer.projects(15) {
+			columnType = ft.InfoSchemaStr()
+		}
+		var columnDefault string
+		var hasColumnDefault bool
+		if e.rowBuffer.projects(5) {
+			columnDefault, hasColumnDefault = infoSchemaColumnDefault(sctx, col, ft)
+		}
+		var isNullable string
+		if e.rowBuffer.projects(6) {
+			isNullable = "YES"
+			if mysql.HasNotNullFlag(col.GetFlag()) {
+				isNullable = "NO"
+			}
+		}
+		var charsetName, collationName string
+		var hasCharsetName, hasCollationName bool
+		if field_types.HasCharset(&col.FieldType) {
+			if e.rowBuffer.projects(13) {
+				charsetName = col.GetCharset()
+				hasCharsetName = true
+			}
+			if e.rowBuffer.projects(14) {
+				collationName = col.GetCollate()
+				hasCollationName = true
+			}
+		}
+		var columnKey string
+		if e.rowBuffer.projects(16) {
+			columnKey = ""
+			switch {
+			case mysql.HasPriKeyFlag(col.GetFlag()):
+				columnKey = "PRI"
+			case mysql.HasUniKeyFlag(col.GetFlag()):
+				columnKey = "UNI"
+			case mysql.HasMultipleKeyFlag(col.GetFlag()):
+				columnKey = "MUL"
+			}
+		}
+		var extra string
+		if e.rowBuffer.projects(17) {
+			extra = infoSchemaColumnExtra(col)
+		}
+		row := e.rowBuffer.appendTypedRow()
+		row.setString(0, infoschema.CatalogVal) // TABLE_CATALOG
+		row.setString(1, schema.O)              // TABLE_SCHEMA
+		row.setString(2, tbl.Name.O)            // TABLE_NAME
+		row.setString(3, col.Name.O)            // COLUMN_NAME
+		row.setInt(4, ordinalPos)               // ORDINAL_POSITION
+		if hasColumnDefault {
+			row.setString(5, columnDefault) // COLUMN_DEFAULT
+		}
+		row.setString(6, isNullable) // IS_NULLABLE
+		row.setString(7, dataType)   // DATA_TYPE
+		if hasCharMaxLen {
+			row.setInt(8, charMaxLen) // CHARACTER_MAXIMUM_LENGTH
+		}
+		if hasCharOctLen {
+			row.setInt(9, charOctLen) // CHARACTER_OCTET_LENGTH
+		}
+		if hasNumericPrecision {
+			row.setInt(10, numericPrecision) // NUMERIC_PRECISION
+		}
+		if hasNumericScale {
+			row.setInt(11, numericScale) // NUMERIC_SCALE
+		}
+		if hasDatetimePrecision {
+			row.setInt(12, datetimePrecision) // DATETIME_PRECISION
+		}
+		if hasCharsetName {
+			row.setString(13, charsetName) // CHARACTER_SET_NAME
+		}
+		if hasCollationName {
+			row.setString(14, collationName) // COLLATION_NAME
+		}
+		row.setString(15, columnType)       // COLUMN_TYPE
+		row.setString(16, columnKey)        // COLUMN_KEY
+		row.setString(17, extra)            // EXTRA
+		row.setString(18, columnPrivileges) // PRIVILEGES
+		row.setString(19, col.Comment)      // COLUMN_COMMENT
+		row.setString(20, col.GeneratedExprString)
 	}
 }
 

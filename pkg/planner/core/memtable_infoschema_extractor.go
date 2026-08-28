@@ -940,6 +940,27 @@ func (e *InfoSchemaColumnsExtractor) ListTables(
 func (e *InfoSchemaColumnsExtractor) ListColumns(
 	tbl *model.TableInfo,
 ) ([]*model.ColumnInfo, []int) {
+	columns := make([]*model.ColumnInfo, 0, len(e.predColNames))
+	ordinalPos := make([]int, 0, len(e.predColNames))
+	ord := 0
+	for _, column := range tbl.Columns {
+		if column.Hidden {
+			continue
+		}
+		ord++
+		if !e.ColumnMatches(column.Name) {
+			continue
+		}
+		columns = append(columns, column)
+		ordinalPos = append(ordinalPos, ord)
+	}
+
+	return columns, ordinalPos
+}
+
+// ColumnMatches reports whether a visible column name passes the extracted
+// equality and regular-expression predicates.
+func (e *InfoSchemaColumnsExtractor) ColumnMatches(name ast.CIStr) bool {
 	ec := e.extractableColumns
 	if !e.predColNamesInited {
 		e.predColNames = set.NewStringSet()
@@ -951,29 +972,15 @@ func (e *InfoSchemaColumnsExtractor) ListColumns(
 	}
 	predCol := e.predColNames
 	regexp := e.GetBase().colsRegexp[ec.columnName]
-
-	columns := make([]*model.ColumnInfo, 0, len(predCol))
-	ordinalPos := make([]int, 0, len(predCol))
-	ord := 0
-ForLoop:
-	for _, column := range tbl.Columns {
-		if column.Hidden {
-			continue
-		}
-		ord++
-		if len(predCol) > 0 && !predCol.Exist(column.Name.L) {
-			continue
-		}
-		for _, re := range regexp {
-			if !re.MatchString(column.Name.L) {
-				continue ForLoop
-			}
-		}
-		columns = append(columns, column)
-		ordinalPos = append(ordinalPos, ord)
+	if len(predCol) > 0 && !predCol.Exist(name.L) {
+		return false
 	}
-
-	return columns, ordinalPos
+	for _, re := range regexp {
+		if !re.MatchString(name.L) {
+			return false
+		}
+	}
+	return true
 }
 
 // InfoSchemaTiDBIndexUsageExtractor is the predicate extractor for information_schema.tidb_index_usage.

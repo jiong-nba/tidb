@@ -72,3 +72,13 @@ func NewReader(snapshot kv.Snapshot) Reader {
 	t := structure.NewStructure(snapshot, nil, mMetaPrefix)
 	return &Mutator{txn: t}
 }
+
+// NewTableInfoIteratorFromSnapshot creates a persistent table metadata
+// iterator positioned strictly after exclusiveStartTableID.
+func NewTableInfoIteratorFromSnapshot(
+	snapshot kv.Snapshot,
+	dbID, exclusiveStartTableID int64,
+) (*TableInfoIterator, error) {
+	reader := NewReader(snapshot)
+	return reader.(*Mutator).NewTableInfoIterator(dbID, exclusiveStartTableID)
+}

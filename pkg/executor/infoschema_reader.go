@@ -1031,6 +1031,7 @@ type hugeMemTableRetriever struct {
 	dummyCloser
 	tablesExtractor    *plannercore.InfoSchemaTablesExtractor
 	columnsExtractor   *plannercore.InfoSchemaColumnsExtractor
+	indexesExtractor   *plannercore.InfoSchemaIndexesExtractor
 	table              *model.TableInfo
 	columns            []*model.ColumnInfo
 	retrieved          bool
@@ -1093,6 +1094,8 @@ func (e *hugeMemTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Co
 		err = e.setDataForHugeTables(ctx, sctx)
 	case infoschema.TableColumns:
 		err = e.setDataForColumns(ctx, sctx)
+	case infoschema.TableTiDBIndexes:
+		err = e.setDataForHugeIndexes(ctx, sctx)
 	}
 	if err != nil {
 		e.tableInfoBatch.finishBatch()
@@ -1144,10 +1147,14 @@ func (e *hugeMemTableRetriever) closeTableInfoIterator() {
 }
 
 func (e *hugeMemTableRetriever) baseExtractor() *plannercore.InfoSchemaBaseExtractor {
-	if e.tablesExtractor != nil {
+	switch {
+	case e.tablesExtractor != nil:
 		return e.tablesExtractor.GetBase()
+	case e.columnsExtractor != nil:
+		return e.columnsExtractor.GetBase()
+	default:
+		return e.indexesExtractor.GetBase()
 	}
-	return e.columnsExtractor.GetBase()
 }
 
 func (e *hugeMemTableRetriever) skipRequest() bool {
@@ -1168,7 +1175,10 @@ func (e *hugeMemTableRetriever) listTablesForSchema(
 	if e.tablesExtractor != nil {
 		return e.is.SchemaTableInfos(ctx, schema)
 	}
-	return e.columnsExtractor.ListTables(ctx, schema, e.is)
+	if e.columnsExtractor != nil {
+		return e.columnsExtractor.ListTables(ctx, schema, e.is)
+	}
+	return e.is.SchemaTableInfos(ctx, schema)
 }
 
 func (e *hugeMemTableRetriever) iterateTables(
@@ -1813,6 +1823,96 @@ func (e *hugeMemTableRetriever) dataForColumnsInTable(
 		row.setString(18, columnPrivileges) // PRIVILEGES
 		row.setString(19, col.Comment)      // COLUMN_COMMENT
 		row.setString(20, col.GeneratedExprString)
+	}
+}
+
+func (e *hugeMemTableRetriever) setDataForHugeIndexes(ctx context.Context, sctx sessionctx.Context) error {
+	checker := privilege.GetPrivilegeManager(sctx)
+	return e.iterateTables(ctx, func(schema ast.CIStr, table *model.TableInfo) (bool, bool) {
+		if !hasTablePrivilege(sctx, checker, schema, table) {
+			return true, false
+		}
+		rowsBefore := e.rowBuffer.len()
+		e.appendHugeIndexRows(schema, table)
+		return e.rowBuffer.len() < e.batch, e.rowBuffer.len() > rowsBefore
+	})
+}
+
+func (e *hugeMemTableRetriever) appendHugeIndexRows(schema ast.CIStr, table *model.TableInfo) {
+	if table.PKIsHandle {
+		var pkCol *model.ColumnInfo
+		for _, col := range table.Cols() {
+			if mysql.HasPriKeyFlag(col.GetFlag()) {
+				pkCol = col
+				break
+			}
+		}
+		e.rowBuffer.appendProjected(
+			schema.O,     // TABLE_SCHEMA
+			table.Name.O, // TABLE_NAME
+			0,            // NON_UNIQUE
+			"PRIMARY",    // KEY_NAME
+			1,            // SEQ_IN_INDEX
+			pkCol.Name.O, // COLUMN_NAME
+			nil,          // SUB_PART
+			"",           // INDEX_COMMENT
+			nil,          // Expression
+			0,            // INDEX_ID
+			"YES",        // IS_VISIBLE
+			"YES",        // CLUSTERED
+			0,            // IS_GLOBAL
+			nil,          // PREDICATE
+		)
+	}
+	for _, idxInfo := range table.Indices {
+		if idxInfo.State != model.StatePublic {
+			continue
+		}
+		isClustered := "NO"
+		if table.IsCommonHandle && idxInfo.Primary {
+			isClustered = "YES"
+		}
+		for i, col := range idxInfo.Columns {
+			nonUniq := 1
+			if idxInfo.Unique {
+				nonUniq = 0
+			}
+			var subPart any
+			if col.Length != types.UnspecifiedLength {
+				subPart = col.Length
+			}
+			colName := col.Name.O
+			var expressionValue any
+			tableCol := table.Columns[col.Offset]
+			if tableCol.Hidden {
+				colName = "NULL"
+				expressionValue = tableCol.GeneratedExprString
+			}
+			visible := "YES"
+			if idxInfo.Invisible {
+				visible = "NO"
+			}
+			var predicate any
+			if idxInfo.ConditionExprString != "" {
+				predicate = idxInfo.ConditionExprString
+			}
+			e.rowBuffer.appendProjected(
+				schema.O,        // TABLE_SCHEMA
+				table.Name.O,    // TABLE_NAME
+				nonUniq,         // NON_UNIQUE
+				idxInfo.Name.O,  // KEY_NAME
+				i+1,             // SEQ_IN_INDEX
+				colName,         // COLUMN_NAME
+				subPart,         // SUB_PART
+				idxInfo.Comment, // INDEX_COMMENT
+				expressionValue, // Expression
+				idxInfo.ID,      // INDEX_ID
+				visible,         // IS_VISIBLE
+				isClustered,     // CLUSTERED
+				idxInfo.Global,  // IS_GLOBAL
+				predicate,       // PREDICATE
+			)
+		}
 	}
 }
 

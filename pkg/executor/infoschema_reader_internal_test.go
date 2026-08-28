@@ -105,6 +105,19 @@ func TestInfoSchemaTablePredicatesUseHugeRetriever(t *testing.T) {
 		reader := builder.Build(plan).(*MemTableReaderExec)
 		require.IsType(t, &hugeMemTableRetriever{}, reader.retriever)
 	}
+
+	indexExtractor := plannercore.NewInfoSchemaIndexesExtractor()
+	indexExtractor.ColPredicates = map[string]set.StringSet{
+		plannercore.TableName: set.NewStringSet("shared"),
+	}
+	indexPlan := physicalop.PhysicalMemTable{
+		DBName:    metadef.InformationSchemaName,
+		Table:     &model.TableInfo{Name: ast.NewCIStr(infoschema.TableTiDBIndexes)},
+		Extractor: indexExtractor,
+	}.Init(sctx, nil, 0)
+	indexPlan.SetSchema(expression.NewSchema())
+	indexReader := builder.Build(indexPlan).(*MemTableReaderExec)
+	require.IsType(t, &hugeMemTableRetriever{}, indexReader.retriever)
 }
 
 func TestHugeMemTableRetrieverKeepsTableInfoIteratorAcrossBatches(t *testing.T) {

@@ -627,6 +627,17 @@ func TestIndexUsageTable(t *testing.T) {
 				where TABLE_NAME = 'idt2' and INDEX_NAME = 'idx_3';`).Check(testkit.Rows())
 	tk.MustQuery(`select TABLE_SCHEMA, TABLE_NAME, INDEX_NAME from information_schema.tidb_index_usage
 				where TABLE_SCHEMA = 'test' and TABLE_NAME = 'idt1' and INDEX_NAME = 'idx_4';`).Check(testkit.Rows())
+
+	tk.MustQuery(`select TABLE_SCHEMA, TABLE_NAME, KEY_NAME, SEQ_IN_INDEX, COLUMN_NAME
+				from information_schema.tidb_indexes
+				where TABLE_SCHEMA = 'test' and TABLE_NAME = 'idt1'
+				order by KEY_NAME, SEQ_IN_INDEX`).Check(testkit.Rows(
+		"test idt1 PRIMARY 1 col_1",
+		"test idt1 idx_1 1 col_1",
+		"test idt1 idx_2 1 col_2",
+		"test idt1 idx_3 1 col_1",
+		"test idt1 idx_3 2 col_2",
+	))
 }
 
 // https://github.com/pingcap/tidb/issues/32459.

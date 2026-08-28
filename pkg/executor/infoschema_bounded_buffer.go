@@ -367,3 +367,75 @@ func reusableTableInfoMemoryUsage(tableInfo *model.TableInfo) int64 {
 	}
 	return usage
 }
+
+type infoSchemaFieldTypeKey struct {
+	tp      byte
+	flag    uint
+	flen    int
+	decimal int
+	charset string
+	collate string
+}
+
+type infoSchemaFieldTypeStrings struct {
+	dataType   string
+	columnType string
+}
+
+const hugeMemTableColumnTypeCacheMaxEntries = 128
+
+var infoSchemaFieldTypeCacheRetainedBytes = 2 * int64(hugeMemTableColumnTypeCacheMaxEntries) * (int64(unsafe.Sizeof(infoSchemaFieldTypeKey{})) +
+	int64(unsafe.Sizeof(infoSchemaFieldTypeStrings{})) +
+	2*size.SizeOfPointer)
+
+func (e *hugeMemTableRetriever) adjustColumnTypeCacheBytes(delta int64) {
+	e.columnTypeCacheBytes += delta
+	if e.memTracker != nil {
+		e.memTracker.Consume(delta)
+	}
+}
+
+func (e *hugeMemTableRetriever) releaseColumnTypeCache() {
+	e.columnTypeCache = nil
+	e.adjustColumnTypeCacheBytes(-e.columnTypeCacheBytes)
+}
+
+func (e *hugeMemTableRetriever) infoSchemaFieldTypeStrings(ft *types.FieldType) infoSchemaFieldTypeStrings {
+	build := func() infoSchemaFieldTypeStrings {
+		colType := ft.GetType()
+		if colType == mysql.TypeVarString {
+			colType = mysql.TypeVarchar
+		}
+		return infoSchemaFieldTypeStrings{
+			dataType:   types.TypeToStr(colType, ft.GetCharset()),
+			columnType: ft.InfoSchemaStr(),
+		}
+	}
+	if len(ft.GetElems()) > 0 || ft.IsArray() {
+		return build()
+	}
+	key := infoSchemaFieldTypeKey{
+		tp:      ft.GetType(),
+		flag:    ft.GetFlag(),
+		flen:    ft.GetFlen(),
+		decimal: ft.GetDecimal(),
+		charset: ft.GetCharset(),
+		collate: ft.GetCollate(),
+	}
+	if cached, ok := e.columnTypeCache[key]; ok {
+		return cached
+	}
+	result := build()
+	if len(e.columnTypeCache) >= hugeMemTableColumnTypeCacheMaxEntries {
+		return result
+	}
+	if e.columnTypeCache == nil {
+		e.columnTypeCache = make(map[infoSchemaFieldTypeKey]infoSchemaFieldTypeStrings, hugeMemTableColumnTypeCacheMaxEntries)
+		e.adjustColumnTypeCacheBytes(infoSchemaFieldTypeCacheRetainedBytes)
+	}
+	e.columnTypeCache[key] = result
+	e.adjustColumnTypeCacheBytes(int64(
+		len(key.charset) + len(key.collate) + len(result.dataType) + len(result.columnType),
+	))
+	return result
+}

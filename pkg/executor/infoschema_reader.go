@@ -1029,31 +1029,33 @@ func (e *memtableRetriever) setDataFromTiDBCheckConstraints(ctx context.Context,
 
 type hugeMemTableRetriever struct {
 	dummyCloser
-	tablesExtractor    *plannercore.InfoSchemaTablesExtractor
-	columnsExtractor   *plannercore.InfoSchemaColumnsExtractor
-	indexesExtractor   *plannercore.InfoSchemaIndexesExtractor
-	table              *model.TableInfo
-	columns            []*model.ColumnInfo
-	retrieved          bool
-	initialized        bool
-	dbs                []ast.CIStr
-	curTables          []*model.TableInfo
-	curTablesLoaded    bool
-	dbsIdx             int
-	tblIdx             int
-	viewMu             syncutil.RWMutex
-	viewSchemaMap      map[int64]*expression.Schema // table id to view schema
-	viewOutputNamesMap map[int64]types.NameSlice    // table id to view output names
-	batch              int
-	is                 infoschema.InfoSchema
-	rowBuffer          *boundedDatumRows
-	tableInfoBatch     *boundedTableInfoBatch
-	memTracker         *memory.Tracker
-	newTableInfoIter   func(context.Context, ast.CIStr, int64) (infoschema.TableInfoIterator, error)
-	tableInfoIter      infoschema.TableInfoIterator
-	tableInfoIterBytes int64
-	iterateTableItems  func(*infoschema.TableItem, func(infoschema.TableItem) bool) (infoschema.TableItem, bool, bool)
-	lastTableItem      *infoschema.TableItem
+	tablesExtractor      *plannercore.InfoSchemaTablesExtractor
+	columnsExtractor     *plannercore.InfoSchemaColumnsExtractor
+	indexesExtractor     *plannercore.InfoSchemaIndexesExtractor
+	table                *model.TableInfo
+	columns              []*model.ColumnInfo
+	retrieved            bool
+	initialized          bool
+	dbs                  []ast.CIStr
+	curTables            []*model.TableInfo
+	curTablesLoaded      bool
+	dbsIdx               int
+	tblIdx               int
+	viewMu               syncutil.RWMutex
+	viewSchemaMap        map[int64]*expression.Schema // table id to view schema
+	viewOutputNamesMap   map[int64]types.NameSlice    // table id to view output names
+	batch                int
+	is                   infoschema.InfoSchema
+	rowBuffer            *boundedDatumRows
+	tableInfoBatch       *boundedTableInfoBatch
+	memTracker           *memory.Tracker
+	newTableInfoIter     func(context.Context, ast.CIStr, int64) (infoschema.TableInfoIterator, error)
+	tableInfoIter        infoschema.TableInfoIterator
+	tableInfoIterBytes   int64
+	columnTypeCache      map[infoSchemaFieldTypeKey]infoSchemaFieldTypeStrings
+	columnTypeCacheBytes int64
+	iterateTableItems    func(*infoschema.TableItem, func(infoschema.TableItem) bool) (infoschema.TableItem, bool, bool)
+	lastTableItem        *infoschema.TableItem
 }
 
 // retrieve implements the infoschemaRetriever interface
@@ -1124,6 +1126,7 @@ func (e *hugeMemTableRetriever) close() error {
 	e.newTableInfoIter = nil
 	e.iterateTableItems = nil
 	e.lastTableItem = nil
+	e.releaseColumnTypeCache()
 	return nil
 }
 
@@ -1735,15 +1738,14 @@ func (e *hugeMemTableRetriever) dataForColumnsInTable(
 		}
 
 		var dataType, columnType string
-		if e.rowBuffer.projects(7) {
-			colType := ft.GetType()
-			if colType == mysql.TypeVarString {
-				colType = mysql.TypeVarchar
+		if e.rowBuffer.projects(7) || e.rowBuffer.projects(15) {
+			fieldTypeStrings := e.infoSchemaFieldTypeStrings(ft)
+			if e.rowBuffer.projects(7) {
+				dataType = fieldTypeStrings.dataType
 			}
-			dataType = types.TypeToStr(colType, ft.GetCharset())
-		}
-		if e.rowBuffer.projects(15) {
-			columnType = ft.InfoSchemaStr()
+			if e.rowBuffer.projects(15) {
+				columnType = fieldTypeStrings.columnType
+			}
 		}
 		var columnDefault string
 		var hasColumnDefault bool

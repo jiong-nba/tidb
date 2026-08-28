@@ -1033,6 +1033,7 @@ type hugeMemTableRetriever struct {
 	rows               [][]types.Datum
 	dbs                []ast.CIStr
 	curTables          []*model.TableInfo
+	curTablesLoaded    bool
 	dbsIdx             int
 	tblIdx             int
 	viewMu             syncutil.RWMutex
@@ -1040,6 +1041,11 @@ type hugeMemTableRetriever struct {
 	viewOutputNamesMap map[int64]types.NameSlice    // table id to view output names
 	batch              int
 	is                 infoschema.InfoSchema
+	tableInfoBatch     *boundedTableInfoBatch
+	memTracker         *memory.Tracker
+	newTableInfoIter   func(context.Context, ast.CIStr, int64) (infoschema.TableInfoIterator, error)
+	tableInfoIter      infoschema.TableInfoIterator
+	tableInfoIterBytes int64
 }
 
 // retrieve implements the infoschemaRetriever interface
@@ -1051,47 +1057,153 @@ func (e *hugeMemTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Co
 	if !e.initialized {
 		e.is = sessiontxn.GetTxnManager(sctx).GetTxnInfoSchema()
 		e.dbs = e.extractor.ListSchemas(e.is)
+		if e.tableInfoBatch == nil {
+			e.tableInfoBatch = newBoundedTableInfoBatch(e.memTracker, hugeMemTableRetainedCapacityLimit)
+		}
+		raw := e.is
+		if extended, ok := raw.(*infoschema.SessionExtendedInfoSchema); ok {
+			raw = extended.InfoSchema
+		}
+		if ok, v2 := infoschema.IsV2(raw); ok {
+			e.newTableInfoIter = v2.NewTableInfoIterator
+		}
 		e.initialized = true
-		e.rows = make([][]types.Datum, 0, 1024)
-		e.batch = 1024
+		e.rows = make([][]types.Datum, 0, hugeMemTableBatchSize)
+		e.batch = hugeMemTableBatchSize
 	}
+	e.tableInfoBatch.beginBatch()
 
-	var err error
-	if e.table.Name.O == infoschema.TableColumns {
-		err = e.setDataForColumns(ctx, sctx)
-	}
+	err := e.setDataForColumns(ctx, sctx)
 	if err != nil {
+		e.tableInfoBatch.finishBatch()
 		return nil, err
 	}
+	e.tableInfoBatch.finishBatch()
 	e.retrieved = len(e.rows) == 0
-
 	return adjustColumns(e.rows, e.columns, e.table), nil
+}
+
+func (e *hugeMemTableRetriever) close() error {
+	if e.tableInfoBatch != nil {
+		e.tableInfoBatch.close()
+		e.tableInfoBatch = nil
+	}
+	e.dbs = nil
+	e.curTables = nil
+	e.viewSchemaMap = nil
+	e.viewOutputNamesMap = nil
+	e.closeTableInfoIterator()
+	e.newTableInfoIter = nil
+	return nil
+}
+
+func (e *hugeMemTableRetriever) syncTableInfoIteratorMemory() {
+	var retainedBytes int64
+	if e.tableInfoIter != nil {
+		retainedBytes = e.tableInfoIter.RetainedMemory()
+	}
+	if e.memTracker != nil {
+		e.memTracker.Consume(retainedBytes - e.tableInfoIterBytes)
+	}
+	e.tableInfoIterBytes = retainedBytes
+}
+
+func (e *hugeMemTableRetriever) closeTableInfoIterator() {
+	if e.tableInfoIter != nil {
+		e.tableInfoIter.Close()
+		e.tableInfoIter = nil
+	}
+	e.syncTableInfoIteratorMemory()
+}
+
+func (e *hugeMemTableRetriever) tableMatches(table *model.TableInfo) bool {
+	return e.extractor.GetBase().HasTableName(table.Name.L)
+}
+
+func (e *hugeMemTableRetriever) listTablesForSchema(
+	ctx context.Context,
+	schema ast.CIStr,
+) ([]*model.TableInfo, error) {
+	return e.extractor.ListTables(ctx, schema, e.is)
+}
+
+func (e *hugeMemTableRetriever) iterateTables(
+	ctx context.Context,
+	visit func(ast.CIStr, *model.TableInfo) (continueIteration bool, retainForBatch bool),
+) error {
+	for e.dbsIdx < len(e.dbs) {
+		schema := e.dbs[e.dbsIdx]
+		if e.newTableInfoIter != nil && !infoschema.IsSpecialDB(schema.L) {
+			if e.tableInfoIter == nil {
+				iter, err := e.newTableInfoIter(ctx, schema, 0)
+				if err != nil {
+					return errors.Trace(err)
+				}
+				e.tableInfoIter = iter
+				e.syncTableInfoIteratorMemory()
+			}
+			for {
+				table, err := e.tableInfoIter.NextInto(ctx, e.tableInfoBatch.nextDestination())
+				e.syncTableInfoIteratorMemory()
+				if err != nil {
+					return errors.Trace(err)
+				}
+				if table == nil {
+					e.closeTableInfoIterator()
+					e.dbsIdx++
+					break
+				}
+				if !e.tableMatches(table) {
+					e.tableInfoBatch.finishDecoded(false)
+					continue
+				}
+				continueIteration, retainForBatch := visit(schema, table)
+				e.tableInfoBatch.finishDecoded(retainForBatch)
+				if !continueIteration {
+					return nil
+				}
+			}
+			continue
+		}
+
+		if !e.curTablesLoaded {
+			tables, err := e.listTablesForSchema(ctx, schema)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			e.curTables = tables
+			e.curTablesLoaded = true
+		}
+		for e.tblIdx < len(e.curTables) {
+			table := e.curTables[e.tblIdx]
+			e.tblIdx++
+			if !e.tableMatches(table) {
+				continue
+			}
+			continueIteration, _ := visit(schema, table)
+			if !continueIteration {
+				return nil
+			}
+			if err := ctx.Err(); err != nil {
+				return errors.Trace(err)
+			}
+		}
+		e.tblIdx = 0
+		e.curTables = nil
+		e.curTablesLoaded = false
+		e.dbsIdx++
+	}
+	return nil
 }
 
 func (e *hugeMemTableRetriever) setDataForColumns(ctx context.Context, sctx sessionctx.Context) error {
 	checker := privilege.GetPrivilegeManager(sctx)
 	e.rows = e.rows[:0]
-	for ; e.dbsIdx < len(e.dbs); e.dbsIdx++ {
-		schema := e.dbs[e.dbsIdx]
-		var table *model.TableInfo
-		if len(e.curTables) == 0 {
-			tables, err := e.extractor.ListTables(ctx, schema, e.is)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			e.curTables = tables
-		}
-		for e.tblIdx < len(e.curTables) {
-			table = e.curTables[e.tblIdx]
-			e.tblIdx++
-			if e.setDataForColumnsWithOneTable(ctx, sctx, schema, table, checker) {
-				return nil
-			}
-		}
-		e.tblIdx = 0
-		e.curTables = e.curTables[:0]
-	}
-	return nil
+	return e.iterateTables(ctx, func(schema ast.CIStr, table *model.TableInfo) (bool, bool) {
+		rowsBefore := len(e.rows)
+		continueIteration := e.setDataForColumnsWithOneTable(ctx, sctx, schema, table, checker)
+		return continueIteration, len(e.rows) > rowsBefore
+	})
 }
 
 func (e *hugeMemTableRetriever) setDataForColumnsWithOneTable(
@@ -1111,12 +1223,12 @@ func (e *hugeMemTableRetriever) setDataForColumnsWithOneTable(
 			}
 		}
 		if !hasPrivs {
-			return false
+			return true
 		}
 	}
 
 	e.dataForColumnsInTable(ctx, sctx, schema, table, priv)
-	return len(e.rows) >= e.batch
+	return len(e.rows) < e.batch
 }
 
 // Ref link https://github.com/mysql/mysql-server/blob/6b6d3ed3d5c6591b446276184642d7d0504ecc86/sql/dd/dd_table.cc#L411

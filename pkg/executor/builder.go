@@ -2690,6 +2690,8 @@ func (b *executorBuilder) buildMemTable(v *physicalop.PhysicalMemTable) exec.Exe
 				retriever:    buildStmtSummaryRetriever(v.Table, v.Columns, extractor),
 			}
 		case strings.ToLower(infoschema.TableColumns):
+			memTracker := memory.NewTracker(v.ID(), -1)
+			memTracker.AttachTo(b.sctx.GetSessionVars().StmtCtx.MemTracker)
 			return &MemTableReaderExec{
 				BaseExecutor: exec.NewBaseExecutor(b.sctx, v.Schema(), v.ID()),
 				table:        v.Table,
@@ -2699,6 +2701,7 @@ func (b *executorBuilder) buildMemTable(v *physicalop.PhysicalMemTable) exec.Exe
 					extractor:          v.Extractor.(*plannercore.InfoSchemaColumnsExtractor),
 					viewSchemaMap:      make(map[int64]*expression.Schema),
 					viewOutputNamesMap: make(map[int64]types.NameSlice),
+					memTracker:         memTracker,
 				},
 			}
 		case strings.ToLower(infoschema.TableSlowQuery), strings.ToLower(infoschema.ClusterTableSlowLog):

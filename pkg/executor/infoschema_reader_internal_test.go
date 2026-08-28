@@ -24,8 +24,111 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	plannercore "github.com/pingcap/tidb/pkg/planner/core"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/memory"
 	"github.com/stretchr/testify/require"
 )
+
+type mockTableInfoIterator struct {
+	tables        []*model.TableInfo
+	next          int
+	closeCount    *int
+	destinations  *[]*model.TableInfo
+	retainedBytes int64
+	closed        bool
+}
+
+func (i *mockTableInfoIterator) NextInto(_ context.Context, destination *model.TableInfo) (*model.TableInfo, error) {
+	if i.next >= len(i.tables) {
+		return nil, nil
+	}
+	table := i.tables[i.next]
+	i.next++
+	if i.destinations != nil {
+		*i.destinations = append(*i.destinations, destination)
+	}
+	*destination = *table
+	return destination, nil
+}
+
+func (i *mockTableInfoIterator) Close() {
+	if i.closed {
+		return
+	}
+	i.closed = true
+	(*i.closeCount)++
+}
+
+func (i *mockTableInfoIterator) RetainedMemory() int64 {
+	if i.closed {
+		return 0
+	}
+	return i.retainedBytes
+}
+
+func TestHugeMemTableRetrieverKeepsTableInfoIteratorAcrossBatches(t *testing.T) {
+	tables := make([]*model.TableInfo, 0, hugeMemTableBatchSize+1)
+	for id := int64(1); id <= hugeMemTableBatchSize+1; id++ {
+		tables = append(tables, &model.TableInfo{ID: id, Name: ast.NewCIStr("t")})
+	}
+
+	openCount := 0
+	closeCount := 0
+	destinations := make([]*model.TableInfo, 0, len(tables))
+	tracker := memory.NewTracker(5, -1)
+	retriever := &hugeMemTableRetriever{
+		extractor:      plannercore.NewInfoSchemaColumnsExtractor(),
+		dbs:            []ast.CIStr{ast.NewCIStr("test")},
+		tableInfoBatch: newBoundedTableInfoBatch(tracker, 1<<20),
+		memTracker:     tracker,
+	}
+	retriever.newTableInfoIter = func(_ context.Context, schema ast.CIStr, exclusiveStartTableID int64) (infoschema.TableInfoIterator, error) {
+		require.Equal(t, "test", schema.L)
+		require.Zero(t, exclusiveStartTableID)
+		openCount++
+		return &mockTableInfoIterator{
+			tables:        tables,
+			closeCount:    &closeCount,
+			destinations:  &destinations,
+			retainedBytes: 4096,
+		}, nil
+	}
+
+	visited := make([]int64, 0, len(tables))
+	retriever.tableInfoBatch.beginBatch()
+	err := retriever.iterateTables(context.Background(), func(_ ast.CIStr, table *model.TableInfo) (bool, bool) {
+		visited = append(visited, table.ID)
+		return len(visited) < hugeMemTableBatchSize, true
+	})
+	require.NoError(t, err)
+	retriever.tableInfoBatch.finishBatch()
+	require.Equal(t, 1, openCount)
+	require.Zero(t, closeCount)
+	require.NotNil(t, retriever.tableInfoIter)
+	require.Equal(t, int64(4096), retriever.tableInfoIterBytes)
+	require.Len(t, destinations, hugeMemTableBatchSize)
+	require.NotSame(t, destinations[0], destinations[1])
+	firstDestination := destinations[0]
+
+	retriever.tableInfoBatch.beginBatch()
+	err = retriever.iterateTables(context.Background(), func(_ ast.CIStr, table *model.TableInfo) (bool, bool) {
+		visited = append(visited, table.ID)
+		return true, true
+	})
+	require.NoError(t, err)
+	retriever.tableInfoBatch.finishBatch()
+	require.Equal(t, 1, openCount)
+	require.Equal(t, 1, closeCount)
+	require.Nil(t, retriever.tableInfoIter)
+	require.Zero(t, retriever.tableInfoIterBytes)
+	require.Len(t, destinations, hugeMemTableBatchSize+1)
+	require.Same(t, firstDestination, destinations[hugeMemTableBatchSize])
+	require.Len(t, visited, hugeMemTableBatchSize+1)
+	for i, id := range visited {
+		require.Equal(t, int64(i+1), id)
+	}
+	retriever.tableInfoBatch.close()
+	require.Zero(t, tracker.BytesConsumed())
+}
 
 func TestSetDataFromCheckConstraints(t *testing.T) {
 	tblInfos := []*model.TableInfo{

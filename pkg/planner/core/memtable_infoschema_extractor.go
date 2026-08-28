@@ -106,7 +106,7 @@ type InfoSchemaBaseExtractor struct {
 	extractableColumns extractableCols
 }
 
-// GetBase is only used for test.
+// GetBase returns the common Information Schema predicate extractor.
 func (e *InfoSchemaBaseExtractor) GetBase() *InfoSchemaBaseExtractor {
 	return e
 }
@@ -123,6 +123,15 @@ func (e *InfoSchemaBaseExtractor) ListSchemas(is infoschema.InfoSchema) []ast.CI
 		return filterSchemaObjectByRegexp(e, e.extractableColumns.schema, ret, extractStrCIStr)
 	}
 	return extractedSchemas
+}
+
+// HasTableName returns whether a table name matches the predicates extracted
+// for the table-name column of this Information Schema table.
+func (e *InfoSchemaBaseExtractor) HasTableName(name string) bool {
+	if e.extractableColumns.table == "" {
+		return true
+	}
+	return !e.filter(e.extractableColumns.table, name)
 }
 
 // listPredicateSchemas lists all schemas specified in predicates.

@@ -1176,7 +1176,10 @@ type infoschemaV2TableInfoIterator struct {
 	exhausted   bool
 }
 
-const metadataScanBatchSize = 32
+const (
+	metadataScanBatchSize            = 32
+	metadataScanResponseRetainedSize = int64(16 << 20)
+)
 
 // NewTableInfoIterator creates a persistent MetaKV iterator positioned
 // strictly after exclusiveStartTableID.
@@ -1236,6 +1239,7 @@ func (i *infoschemaV2TableInfoIterator) reopen(ctx context.Context) error {
 		// the same bounded TiKV request timeout as the existing list API.
 		snapshot.SetOption(kv.TiKVClientReadTimeout, uint64(3000)) // 3000ms.
 		snapshot.SetOption(kv.ScanBatchSize, metadataScanBatchSize)
+		snapshot.SetOption(kv.ScanResponseRetainedSize, metadataScanResponseRetainedSize)
 		iter, err := meta.NewTableInfoIteratorFromSnapshotWithDecodeMode(
 			snapshot,
 			i.dbID,

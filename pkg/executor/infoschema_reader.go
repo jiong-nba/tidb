@@ -644,19 +644,16 @@ func (e *memtableRetriever) setDataFromReferConst(ctx context.Context, sctx sess
 	return nil
 }
 
-func (e *memtableRetriever) updateStatsCacheIfNeed(sctx sessionctx.Context, tbls []*model.TableInfo) {
-	needUpdate := false
-	for _, col := range e.columns {
-		// only the following columns need stats cache.
+func tableStatsCacheRequired(columns []*model.ColumnInfo) bool {
+	for _, col := range columns {
 		if col.Name.O == "AVG_ROW_LENGTH" || col.Name.O == "DATA_LENGTH" || col.Name.O == "INDEX_LENGTH" || col.Name.O == "TABLE_ROWS" {
-			needUpdate = true
-			break
+			return true
 		}
 	}
-	if !needUpdate {
-		return
-	}
+	return false
+}
 
+func updateTableStatsCache(sctx sessionctx.Context, tbls []*model.TableInfo) {
 	tableIDs := make([]int64, 0, len(tbls))
 	for _, tbl := range tbls {
 		if pi := tbl.GetPartitionInfo(); pi != nil {
@@ -674,6 +671,12 @@ func (e *memtableRetriever) updateStatsCacheIfNeed(sctx sessionctx.Context, tbls
 		logutil.BgLogger().Warn("cannot update stats cache for tables", zap.Error(err))
 	}
 	intest.AssertNoError(err)
+}
+
+func (e *memtableRetriever) updateStatsCacheIfNeed(sctx sessionctx.Context, tbls []*model.TableInfo) {
+	if tableStatsCacheRequired(e.columns) {
+		updateTableStatsCache(sctx, tbls)
+	}
 }
 
 func (e *memtableRetriever) setDataFromOneTable(
@@ -1026,7 +1029,8 @@ func (e *memtableRetriever) setDataFromTiDBCheckConstraints(ctx context.Context,
 
 type hugeMemTableRetriever struct {
 	dummyCloser
-	extractor          *plannercore.InfoSchemaColumnsExtractor
+	tablesExtractor    *plannercore.InfoSchemaTablesExtractor
+	columnsExtractor   *plannercore.InfoSchemaColumnsExtractor
 	table              *model.TableInfo
 	columns            []*model.ColumnInfo
 	retrieved          bool
@@ -1047,17 +1051,19 @@ type hugeMemTableRetriever struct {
 	newTableInfoIter   func(context.Context, ast.CIStr, int64) (infoschema.TableInfoIterator, error)
 	tableInfoIter      infoschema.TableInfoIterator
 	tableInfoIterBytes int64
+	iterateTableItems  func(*infoschema.TableItem, func(infoschema.TableItem) bool) (infoschema.TableItem, bool, bool)
+	lastTableItem      *infoschema.TableItem
 }
 
 // retrieve implements the infoschemaRetriever interface
 func (e *hugeMemTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Context) ([][]types.Datum, error) {
-	if e.extractor.SkipRequest || e.retrieved {
+	if e.skipRequest() || e.retrieved {
 		return nil, nil
 	}
 
 	if !e.initialized {
 		e.is = sessiontxn.GetTxnManager(sctx).GetTxnInfoSchema()
-		e.dbs = e.extractor.ListSchemas(e.is)
+		e.dbs = e.baseExtractor().ListSchemas(e.is)
 		e.rowBuffer = newBoundedDatumRows(
 			e.table,
 			e.columns,
@@ -1073,6 +1079,7 @@ func (e *hugeMemTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Co
 		}
 		if ok, v2 := infoschema.IsV2(raw); ok {
 			e.newTableInfoIter = v2.NewTableInfoIterator
+			e.iterateTableItems = v2.IterateAllTableItemsFrom
 		}
 		e.initialized = true
 		e.batch = hugeMemTableBatchSize
@@ -1080,7 +1087,13 @@ func (e *hugeMemTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Co
 	e.rowBuffer.beginBatch()
 	e.tableInfoBatch.beginBatch()
 
-	err := e.setDataForColumns(ctx, sctx)
+	var err error
+	switch e.table.Name.O {
+	case infoschema.TableTables:
+		err = e.setDataForHugeTables(ctx, sctx)
+	case infoschema.TableColumns:
+		err = e.setDataForColumns(ctx, sctx)
+	}
 	if err != nil {
 		e.tableInfoBatch.finishBatch()
 		return nil, err
@@ -1106,6 +1119,8 @@ func (e *hugeMemTableRetriever) close() error {
 	e.viewOutputNamesMap = nil
 	e.closeTableInfoIterator()
 	e.newTableInfoIter = nil
+	e.iterateTableItems = nil
+	e.lastTableItem = nil
 	return nil
 }
 
@@ -1128,15 +1143,32 @@ func (e *hugeMemTableRetriever) closeTableInfoIterator() {
 	e.syncTableInfoIteratorMemory()
 }
 
+func (e *hugeMemTableRetriever) baseExtractor() *plannercore.InfoSchemaBaseExtractor {
+	if e.tablesExtractor != nil {
+		return e.tablesExtractor.GetBase()
+	}
+	return e.columnsExtractor.GetBase()
+}
+
+func (e *hugeMemTableRetriever) skipRequest() bool {
+	return e.baseExtractor().SkipRequest
+}
+
 func (e *hugeMemTableRetriever) tableMatches(table *model.TableInfo) bool {
-	return e.extractor.GetBase().HasTableName(table.Name.L)
+	if !e.baseExtractor().HasTableName(table.Name.L) {
+		return false
+	}
+	return e.tablesExtractor == nil || e.tablesExtractor.HasTableID(table.ID)
 }
 
 func (e *hugeMemTableRetriever) listTablesForSchema(
 	ctx context.Context,
 	schema ast.CIStr,
 ) ([]*model.TableInfo, error) {
-	return e.extractor.ListTables(ctx, schema, e.is)
+	if e.tablesExtractor != nil {
+		return e.is.SchemaTableInfos(ctx, schema)
+	}
+	return e.columnsExtractor.ListTables(ctx, schema, e.is)
 }
 
 func (e *hugeMemTableRetriever) iterateTables(
@@ -1206,6 +1238,242 @@ func (e *hugeMemTableRetriever) iterateTables(
 		e.dbsIdx++
 	}
 	return nil
+}
+
+func (e *hugeMemTableRetriever) setDataForHugeTables(ctx context.Context, sctx sessionctx.Context) error {
+	checker := privilege.GetPrivilegeManager(sctx)
+	if onlySchemaOrTableColumns(e.columns) && onlySchemaOrTableColPredicates(e.tablesExtractor.ColPredicates) && e.iterateTableItems != nil {
+		if x := ctx.Value("cover-check"); x != nil {
+			*x.(*bool) = true
+		}
+		return e.setDataForHugeTablesFromItems(ctx, sctx, checker)
+	}
+
+	loc := sctx.GetSessionVars().TimeZone
+	if loc == nil {
+		loc = time.Local
+	}
+
+	if !tableStatsCacheRequired(e.columns) {
+		return e.iterateTables(ctx, func(schema ast.CIStr, table *model.TableInfo) (bool, bool) {
+			if !hasTablePrivilege(sctx, checker, schema, table) {
+				return true, false
+			}
+			e.appendHugeTableRow(sctx, loc, schema, table, false)
+			return e.rowBuffer.len() < e.batch, true
+		})
+	}
+
+	batchTables := make([]*model.TableInfo, 0, e.batch)
+	batchSchemas := make([]ast.CIStr, 0, e.batch)
+	err := e.iterateTables(ctx, func(schema ast.CIStr, table *model.TableInfo) (bool, bool) {
+		if !hasTablePrivilege(sctx, checker, schema, table) {
+			return true, false
+		}
+		batchTables = append(batchTables, table)
+		batchSchemas = append(batchSchemas, schema)
+		return len(batchTables) < e.batch, true
+	})
+	if err != nil {
+		return err
+	}
+	updateTableStatsCache(sctx, batchTables)
+	for i, table := range batchTables {
+		e.appendHugeTableRow(sctx, loc, batchSchemas[i], table, true)
+	}
+	return nil
+}
+
+func (e *hugeMemTableRetriever) setDataForHugeTablesFromItems(
+	ctx context.Context,
+	sctx sessionctx.Context,
+	checker privilege.Manager,
+) error {
+	var iterErr error
+	last, hasLast, _ := e.iterateTableItems(e.lastTableItem, func(item infoschema.TableItem) bool {
+		if err := ctx.Err(); err != nil {
+			iterErr = err
+			return false
+		}
+		if !e.tablesExtractor.HasTableName(item.TableName.L) || !e.tablesExtractor.HasTableSchema(item.DBName.L) {
+			return true
+		}
+		if checker != nil && !checker.RequestVerification(sctx.GetSessionVars().ActiveRoles, item.DBName.L, item.TableName.L, "", mysql.AllPrivMask) {
+			return true
+		}
+		e.rowBuffer.appendProjected(
+			infoschema.CatalogVal, // TABLE_CATALOG
+			item.DBName.O,         // TABLE_SCHEMA
+			item.TableName.O,      // TABLE_NAME
+			nil,                   // TABLE_TYPE
+			nil,                   // ENGINE
+			nil,                   // VERSION
+			nil,                   // ROW_FORMAT
+			nil,                   // TABLE_ROWS
+			nil,                   // AVG_ROW_LENGTH
+			nil,                   // DATA_LENGTH
+			nil,                   // MAX_DATA_LENGTH
+			nil,                   // INDEX_LENGTH
+			nil,                   // DATA_FREE
+			nil,                   // AUTO_INCREMENT
+			nil,                   // CREATE_TIME
+			nil,                   // UPDATE_TIME
+			nil,                   // CHECK_TIME
+			nil,                   // TABLE_COLLATION
+			nil,                   // CHECKSUM
+			nil,                   // CREATE_OPTIONS
+			nil,                   // TABLE_COMMENT
+			nil,                   // TIDB_TABLE_ID
+			nil,                   // TIDB_ROW_ID_SHARDING_INFO
+			nil,                   // TIDB_PK_TYPE
+			nil,                   // TIDB_PLACEMENT_POLICY_NAME
+			nil,                   // TIDB_TABLE_MODE
+			nil,                   // TIDB_AFFINITY
+			nil,                   // TIDB_STORAGE_CLASS
+		)
+		return e.rowBuffer.len() < e.batch
+	})
+	if hasLast {
+		lastCopy := last
+		e.lastTableItem = &lastCopy
+	}
+	return errors.Trace(iterErr)
+}
+
+func hasTablePrivilege(
+	sctx sessionctx.Context,
+	checker privilege.Manager,
+	schema ast.CIStr,
+	table *model.TableInfo,
+) bool {
+	return checker == nil || checker.RequestVerification(sctx.GetSessionVars().ActiveRoles, schema.L, table.Name.L, "", mysql.AllPrivMask)
+}
+
+func (e *hugeMemTableRetriever) appendHugeTableRow(
+	sctx sessionctx.Context,
+	loc *time.Location,
+	schema ast.CIStr,
+	table *model.TableInfo,
+	statsReady bool,
+) {
+	collation := table.Collate
+	if collation == "" {
+		collation = mysql.DefaultCollationName
+	}
+	var createTime any
+	if e.rowBuffer.projects(14) {
+		createTime = types.NewTime(types.FromGoTime(table.GetUpdateTime().In(loc)), mysql.TypeDatetime, types.DefaultFsp)
+	}
+
+	pkType := "NONCLUSTERED"
+	if table.HasClusteredIndex() {
+		pkType = "CLUSTERED"
+	}
+	if table.IsView() {
+		e.rowBuffer.appendProjected(
+			infoschema.CatalogVal, // TABLE_CATALOG
+			schema.O,              // TABLE_SCHEMA
+			table.Name.O,          // TABLE_NAME
+			"VIEW",                // TABLE_TYPE
+			nil,                   // ENGINE
+			nil,                   // VERSION
+			nil,                   // ROW_FORMAT
+			nil,                   // TABLE_ROWS
+			nil,                   // AVG_ROW_LENGTH
+			nil,                   // DATA_LENGTH
+			nil,                   // MAX_DATA_LENGTH
+			nil,                   // INDEX_LENGTH
+			nil,                   // DATA_FREE
+			nil,                   // AUTO_INCREMENT
+			createTime,            // CREATE_TIME
+			nil,                   // UPDATE_TIME
+			nil,                   // CHECK_TIME
+			nil,                   // TABLE_COLLATION
+			nil,                   // CHECKSUM
+			nil,                   // CREATE_OPTIONS
+			"VIEW",                // TABLE_COMMENT
+			table.ID,              // TIDB_TABLE_ID
+			nil,                   // TIDB_ROW_ID_SHARDING_INFO
+			pkType,                // TIDB_PK_TYPE
+			nil,                   // TIDB_PLACEMENT_POLICY_NAME
+			nil,                   // TIDB_TABLE_MODE
+			nil,                   // TIDB_AFFINITY
+			nil,                   // TIDB_STORAGE_CLASS
+		)
+		return
+	}
+
+	createOptions := ""
+	if table.GetPartitionInfo() != nil {
+		createOptions = "partitioned"
+	} else if table.TableCacheStatusType == model.TableCacheStatusEnable {
+		createOptions = "cached=on"
+	}
+	var autoIncID any
+	if e.rowBuffer.projects(13) {
+		hasAutoIncID, _ := infoschema.HasAutoIncrementColumn(table)
+		if hasAutoIncID {
+			autoIncID = getAutoIncrementID(e.is, sctx, table)
+		}
+	}
+	tableType := "BASE TABLE"
+	if metadef.IsMemDB(schema.L) {
+		tableType = "SYSTEM VIEW"
+	}
+	if table.IsSequence() {
+		tableType = "SEQUENCE"
+	}
+	var policyName any
+	if table.PlacementPolicyRef != nil {
+		policyName = table.PlacementPolicyRef.Name.O
+	}
+	var affinity any
+	if info := table.Affinity; info != nil {
+		affinity = info.Level
+	}
+	var rowCount, avgRowLength, dataLength, indexLength any
+	if statsReady {
+		rowCount, avgRowLength, dataLength, indexLength = cache.TableRowStatsCache.EstimateDataLength(table)
+	}
+	var shardingInfo any
+	if e.rowBuffer.projects(22) {
+		shardingInfo = infoschema.GetShardingInfo(schema, table)
+	}
+	var storageClass any
+	if e.rowBuffer.projects(27) {
+		storageClass = table.StorageClassString()
+	}
+
+	e.rowBuffer.appendProjected(
+		infoschema.CatalogVal, // TABLE_CATALOG
+		schema.O,              // TABLE_SCHEMA
+		table.Name.O,          // TABLE_NAME
+		tableType,             // TABLE_TYPE
+		"InnoDB",              // ENGINE
+		uint64(10),            // VERSION
+		"Compact",             // ROW_FORMAT
+		rowCount,              // TABLE_ROWS
+		avgRowLength,          // AVG_ROW_LENGTH
+		dataLength,            // DATA_LENGTH
+		uint64(0),             // MAX_DATA_LENGTH
+		indexLength,           // INDEX_LENGTH
+		uint64(0),             // DATA_FREE
+		autoIncID,             // AUTO_INCREMENT
+		createTime,            // CREATE_TIME
+		nil,                   // UPDATE_TIME
+		nil,                   // CHECK_TIME
+		collation,             // TABLE_COLLATION
+		nil,                   // CHECKSUM
+		createOptions,         // CREATE_OPTIONS
+		table.Comment,         // TABLE_COMMENT
+		table.ID,              // TIDB_TABLE_ID
+		shardingInfo,          // TIDB_ROW_ID_SHARDING_INFO
+		pkType,                // TIDB_PK_TYPE
+		policyName,            // TIDB_PLACEMENT_POLICY_NAME
+		table.Mode.String(),   // TIDB_TABLE_MODE
+		affinity,              // TIDB_AFFINITY
+		storageClass,          // TIDB_STORAGE_CLASS
+	)
 }
 
 func (e *hugeMemTableRetriever) setDataForColumns(ctx context.Context, sctx sessionctx.Context) error {
@@ -1357,7 +1625,7 @@ func (e *hugeMemTableRetriever) dataForColumnsInTable(
 			continue
 		}
 		ordinalPos++
-		if !e.extractor.ColumnMatches(col.Name) {
+		if !e.columnsExtractor.ColumnMatches(col.Name) {
 			continue
 		}
 		// Skip non-public columns

@@ -29,6 +29,7 @@ import (
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/memory"
 	"github.com/pingcap/tidb/pkg/util/mock"
+	"github.com/pingcap/tidb/pkg/util/set"
 	"github.com/stretchr/testify/require"
 )
 
@@ -83,6 +84,29 @@ func TestInfoSchemaColumnsUsesHugeRetriever(t *testing.T) {
 	require.IsType(t, &hugeMemTableRetriever{}, reader.retriever)
 }
 
+func TestInfoSchemaTablePredicatesUseHugeRetriever(t *testing.T) {
+	sctx := mock.NewContext()
+	is := infoschema.MockInfoSchema(nil)
+	builder := NewMockExecutorBuilderForTest(sctx, is, nil)
+
+	for _, predicates := range []map[string]set.StringSet{
+		{plannercore.TableName: set.NewStringSet("shared")},
+		{plannercore.TableName: set.NewStringSet("shared", "other")},
+		{plannercore.TidbTableID: set.NewStringSet("42")},
+	} {
+		extractor := plannercore.NewInfoSchemaTablesExtractor()
+		extractor.ColPredicates = predicates
+		plan := physicalop.PhysicalMemTable{
+			DBName:    metadef.InformationSchemaName,
+			Table:     &model.TableInfo{Name: ast.NewCIStr(infoschema.TableTables)},
+			Extractor: extractor,
+		}.Init(sctx, nil, 0)
+		plan.SetSchema(expression.NewSchema())
+		reader := builder.Build(plan).(*MemTableReaderExec)
+		require.IsType(t, &hugeMemTableRetriever{}, reader.retriever)
+	}
+}
+
 func TestHugeMemTableRetrieverKeepsTableInfoIteratorAcrossBatches(t *testing.T) {
 	tables := make([]*model.TableInfo, 0, hugeMemTableBatchSize+1)
 	for id := int64(1); id <= hugeMemTableBatchSize+1; id++ {
@@ -94,10 +118,10 @@ func TestHugeMemTableRetrieverKeepsTableInfoIteratorAcrossBatches(t *testing.T) 
 	destinations := make([]*model.TableInfo, 0, len(tables))
 	tracker := memory.NewTracker(5, -1)
 	retriever := &hugeMemTableRetriever{
-		extractor:      plannercore.NewInfoSchemaColumnsExtractor(),
-		dbs:            []ast.CIStr{ast.NewCIStr("test")},
-		tableInfoBatch: newBoundedTableInfoBatch(tracker, 1<<20),
-		memTracker:     tracker,
+		columnsExtractor: plannercore.NewInfoSchemaColumnsExtractor(),
+		dbs:              []ast.CIStr{ast.NewCIStr("test")},
+		tableInfoBatch:   newBoundedTableInfoBatch(tracker, 1<<20),
+		memTracker:       tracker,
 	}
 	retriever.newTableInfoIter = func(_ context.Context, schema ast.CIStr, exclusiveStartTableID int64) (infoschema.TableInfoIterator, error) {
 		require.Equal(t, "test", schema.L)

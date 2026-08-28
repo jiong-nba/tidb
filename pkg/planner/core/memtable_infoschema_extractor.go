@@ -355,6 +355,11 @@ func (e *InfoSchemaTablesExtractor) HasTableSchema(name string) bool {
 	return !e.filter(TableSchema, name)
 }
 
+// HasTableID returns whether a table ID matches the extracted predicates.
+func (e *InfoSchemaTablesExtractor) HasTableID(id int64) bool {
+	return !e.filter(TidbTableID, strconv.FormatInt(id, 10))
+}
+
 // InfoSchemaDDLExtractor is the predicate extractor for information_schema.ddl_jobs.
 type InfoSchemaDDLExtractor struct {
 	InfoSchemaBaseExtractor

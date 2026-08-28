@@ -2586,7 +2586,6 @@ func (b *executorBuilder) buildMemTable(v *physicalop.PhysicalMemTable) exec.Exe
 			strings.ToLower(infoschema.TableStatistics),
 			strings.ToLower(infoschema.TableTiDBIndexes),
 			strings.ToLower(infoschema.TableViews),
-			strings.ToLower(infoschema.TableTables),
 			strings.ToLower(infoschema.TableReferConst),
 			strings.ToLower(infoschema.TableSequences),
 			strings.ToLower(infoschema.TablePartitions),
@@ -2689,20 +2688,27 @@ func (b *executorBuilder) buildMemTable(v *physicalop.PhysicalMemTable) exec.Exe
 				table:        v.Table,
 				retriever:    buildStmtSummaryRetriever(v.Table, v.Columns, extractor),
 			}
-		case strings.ToLower(infoschema.TableColumns):
+		case strings.ToLower(infoschema.TableTables),
+			strings.ToLower(infoschema.TableColumns):
 			memTracker := memory.NewTracker(v.ID(), -1)
 			memTracker.AttachTo(b.sctx.GetSessionVars().StmtCtx.MemTracker)
+			retriever := &hugeMemTableRetriever{
+				table:      v.Table,
+				columns:    v.Columns,
+				memTracker: memTracker,
+			}
+			switch v.Table.Name.L {
+			case strings.ToLower(infoschema.TableTables):
+				retriever.tablesExtractor = v.Extractor.(*plannercore.InfoSchemaTablesExtractor)
+			case strings.ToLower(infoschema.TableColumns):
+				retriever.columnsExtractor = v.Extractor.(*plannercore.InfoSchemaColumnsExtractor)
+				retriever.viewSchemaMap = make(map[int64]*expression.Schema)
+				retriever.viewOutputNamesMap = make(map[int64]types.NameSlice)
+			}
 			return &MemTableReaderExec{
 				BaseExecutor: exec.NewBaseExecutor(b.sctx, v.Schema(), v.ID()),
 				table:        v.Table,
-				retriever: &hugeMemTableRetriever{
-					table:              v.Table,
-					columns:            v.Columns,
-					extractor:          v.Extractor.(*plannercore.InfoSchemaColumnsExtractor),
-					viewSchemaMap:      make(map[int64]*expression.Schema),
-					viewOutputNamesMap: make(map[int64]types.NameSlice),
-					memTracker:         memTracker,
-				},
+				retriever:    retriever,
 			}
 		case strings.ToLower(infoschema.TableSlowQuery), strings.ToLower(infoschema.ClusterTableSlowLog):
 			extractor := v.Extractor.(*plannercore.SlowQueryExtractor)

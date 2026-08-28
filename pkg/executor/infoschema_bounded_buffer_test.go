@@ -18,6 +18,8 @@ import (
 	"testing"
 
 	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/memory"
 	"github.com/stretchr/testify/require"
 )
@@ -137,4 +139,27 @@ func TestBoundedDatumRows(t *testing.T) {
 		require.Greater(t, partitionedUsage, baseUsage)
 	})
 
+	t.Run("column type cache is bounded and tracked", func(t *testing.T) {
+		tracker := memory.NewTracker(6, -1)
+		retriever := &hugeMemTableRetriever{memTracker: tracker}
+		for i := 0; i < hugeMemTableColumnTypeCacheMaxEntries; i++ {
+			ft := types.NewFieldType(mysql.TypeVarchar)
+			ft.SetFlen(i + 1)
+			retriever.infoSchemaFieldTypeStrings(ft)
+		}
+		retainedAtLimit := tracker.BytesConsumed()
+		require.Equal(t, hugeMemTableColumnTypeCacheMaxEntries, len(retriever.columnTypeCache))
+		require.Positive(t, retainedAtLimit)
+
+		for i := hugeMemTableColumnTypeCacheMaxEntries; i < 1024; i++ {
+			ft := types.NewFieldType(mysql.TypeVarchar)
+			ft.SetFlen(i + 1)
+			retriever.infoSchemaFieldTypeStrings(ft)
+		}
+		require.Equal(t, hugeMemTableColumnTypeCacheMaxEntries, len(retriever.columnTypeCache))
+		require.Equal(t, retainedAtLimit, tracker.BytesConsumed())
+
+		require.NoError(t, retriever.close())
+		require.Zero(t, tracker.BytesConsumed())
+	})
 }

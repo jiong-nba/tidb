@@ -1079,7 +1079,11 @@ func (e *hugeMemTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Co
 			raw = extended.InfoSchema
 		}
 		if ok, v2 := infoschema.IsV2(raw); ok {
-			e.newTableInfoIter = v2.NewTableInfoIterator
+			if e.columnsExtractor != nil {
+				e.newTableInfoIter = v2.NewColumnsTableInfoIterator
+			} else {
+				e.newTableInfoIter = v2.NewTableInfoIterator
+			}
 			e.iterateTableItems = v2.IterateAllTableItemsFrom
 		}
 		e.initialized = true

@@ -46,6 +46,7 @@ func TestV2Basic(t *testing.T) {
 	internal.AddDB(t, r.Store(), dbInfo)
 	tblInfo := internal.MockTableInfo(t, r.Store(), tableName.O)
 	tblInfo.DBID = dbInfo.ID
+	tblInfo.Comment = "field not needed by INFORMATION_SCHEMA.COLUMNS"
 	is.Data.add(tableItem{schemaName, dbInfo.ID, tableName, tblInfo.ID, 2, false}, internal.MockTable(t, r.Store(), tblInfo))
 	internal.AddTable(t, r.Store(), dbInfo.ID, tblInfo)
 	is.base().schemaMetaVersion = 1
@@ -200,6 +201,16 @@ func TestV2Basic(t *testing.T) {
 	}
 	persistentIter.Close()
 	require.Equal(t, expectedIDs, persistentIDs)
+
+	columnsIter, err := is.NewColumnsTableInfoIterator(context.Background(), schemaName, 0)
+	require.NoError(t, err)
+	columnsTableInfo, err := columnsIter.NextInto(context.Background(), &model.TableInfo{})
+	require.NoError(t, err)
+	require.Equal(t, tblInfo.ID, columnsTableInfo.ID)
+	require.Equal(t, tblInfo.Name, columnsTableInfo.Name)
+	require.Equal(t, tblInfo.Columns, columnsTableInfo.Columns)
+	require.Empty(t, columnsTableInfo.Comment)
+	columnsIter.Close()
 
 	var iteratedNames []string
 	is.Data.recentMinTS.Store(math.MaxUint64)

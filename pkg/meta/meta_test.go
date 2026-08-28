@@ -490,6 +490,44 @@ func TestMeta(t *testing.T) {
 		require.Nil(t, decoded)
 		iter.Close()
 
+		columnsIter, err := m.NewTableInfoIteratorWithDecodeMode(
+			1,
+			tbInfo2.ID,
+			meta.TableInfoDecodeColumns,
+		)
+		require.NoError(t, err)
+		columnsDestination := &model.TableInfo{}
+		decoded, err = columnsIter.NextInto(context.Background(), columnsDestination)
+		require.NoError(t, err)
+		require.Same(t, columnsDestination, decoded)
+		require.Equal(t, richTable.ID, decoded.ID)
+		require.Equal(t, richTable.Name, decoded.Name)
+		require.Equal(t, richTable.Charset, decoded.Charset)
+		require.Equal(t, richTable.Collate, decoded.Collate)
+		require.Equal(t, richTable.State, decoded.State)
+		require.Equal(t, richTable.Columns, decoded.Columns)
+		require.Equal(t, richTable.View, decoded.View)
+		require.Empty(t, decoded.Indices)
+		require.Empty(t, decoded.Constraints)
+		require.Empty(t, decoded.ForeignKeys)
+		columnPointer = decoded.Columns[0]
+
+		decoded, err = columnsIter.NextInto(context.Background(), columnsDestination)
+		require.NoError(t, err)
+		require.Same(t, columnsDestination, decoded)
+		require.Same(t, columnPointer, decoded.Columns[0])
+		require.Equal(t, sparseTable.Columns, decoded.Columns)
+		require.Nil(t, decoded.View)
+		require.Empty(t, decoded.Indices)
+		require.Empty(t, decoded.Constraints)
+		require.Empty(t, decoded.ForeignKeys)
+		require.Positive(t, columnsIter.RetainedMemory())
+		columnsIter.Close()
+		require.Zero(t, columnsIter.RetainedMemory())
+
+		_, err = m.NewTableInfoIteratorWithDecodeMode(1, 0, meta.TableInfoDecodeMode(255))
+		require.ErrorContains(t, err, "unknown table info decode mode 255")
+
 		require.NoError(t, m.DropTableOrView(1, richTable.ID))
 		require.NoError(t, m.DropTableOrView(1, sparseTable.ID))
 	}

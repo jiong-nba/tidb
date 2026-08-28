@@ -79,6 +79,21 @@ func NewTableInfoIteratorFromSnapshot(
 	snapshot kv.Snapshot,
 	dbID, exclusiveStartTableID int64,
 ) (*TableInfoIterator, error) {
+	return NewTableInfoIteratorFromSnapshotWithDecodeMode(
+		snapshot,
+		dbID,
+		exclusiveStartTableID,
+		TableInfoDecodeAll,
+	)
+}
+
+// NewTableInfoIteratorFromSnapshotWithDecodeMode creates a persistent table
+// metadata iterator with projection-aware JSON decoding.
+func NewTableInfoIteratorFromSnapshotWithDecodeMode(
+	snapshot kv.Snapshot,
+	dbID, exclusiveStartTableID int64,
+	decodeMode TableInfoDecodeMode,
+) (*TableInfoIterator, error) {
 	reader := NewReader(snapshot)
-	return reader.(*Mutator).NewTableInfoIterator(dbID, exclusiveStartTableID)
+	return reader.(*Mutator).NewTableInfoIteratorWithDecodeMode(dbID, exclusiveStartTableID, decodeMode)
 }

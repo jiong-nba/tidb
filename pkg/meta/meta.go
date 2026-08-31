@@ -1178,6 +1178,139 @@ func (m *Mutator) IterTables(dbID int64, fn func(info *model.TableInfo) error) e
 	return errors.Trace(err)
 }
 
+// TableInfoIterator decodes table metadata from one persistent MetaKV scanner.
+// It must be closed when the caller stops before exhaustion.
+type TableInfoIterator struct {
+	dbID int64
+	iter *structure.HashIterator
+}
+
+// NewTableInfoIterator creates a persistent iterator positioned strictly after
+// exclusiveStartTableID.
+func (m *Mutator) NewTableInfoIterator(dbID, exclusiveStartTableID int64) (*TableInfoIterator, error) {
+	dbKey := m.dbKey(dbID)
+	if err := m.checkDBExists(dbKey); err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	var startField []byte
+	if exclusiveStartTableID != 0 {
+		startField = m.tableKey(exclusiveStartTableID)
+	}
+	iter, err := structure.NewHashIterator(m.txn, dbKey, startField)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return &TableInfoIterator{dbID: dbID, iter: iter}, nil
+}
+
+// NextInto decodes the next table into destination or returns nil when the
+// iterator is exhausted. The caller must not reuse destination while values
+// derived from the returned TableInfo are still in use.
+func (i *TableInfoIterator) NextInto(ctx context.Context, destination *model.TableInfo) (*model.TableInfo, error) {
+	if destination == nil {
+		destination = &model.TableInfo{}
+	}
+	for i.iter != nil && i.iter.Valid() {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.Trace(err)
+		}
+
+		isTable := strings.HasPrefix(string(i.iter.Field()), mTablePrefix)
+		var tableInfo *model.TableInfo
+		if isTable {
+			tableInfo = destination
+			resetTableInfoForJSONDecode(tableInfo)
+			if err := json.Unmarshal(i.iter.Value(), tableInfo); err != nil {
+				return nil, errors.Trace(err)
+			}
+			tableInfo.DBID = i.dbID
+		}
+		if err := i.iter.Next(); err != nil {
+			return nil, errors.Trace(err)
+		}
+		if tableInfo != nil {
+			return tableInfo, nil
+		}
+	}
+	return nil, nil
+}
+
+func resetColumnsForJSONDecode(columns []*model.ColumnInfo) []*model.ColumnInfo {
+	for _, column := range columns[:cap(columns)] {
+		if column != nil {
+			*column = model.ColumnInfo{}
+		}
+	}
+	return columns[:0]
+}
+
+func resetTableInfoForJSONDecode(tableInfo *model.TableInfo) {
+	columns := resetColumnsForJSONDecode(tableInfo.Columns)
+
+	indices := tableInfo.Indices
+	for _, index := range indices[:cap(indices)] {
+		if index == nil {
+			continue
+		}
+		indexColumns := index.Columns
+		for _, column := range indexColumns[:cap(indexColumns)] {
+			if column != nil {
+				*column = model.IndexColumn{}
+			}
+		}
+		*index = model.IndexInfo{Columns: indexColumns[:0]}
+	}
+
+	constraints := tableInfo.Constraints
+	for _, constraint := range constraints[:cap(constraints)] {
+		if constraint == nil {
+			continue
+		}
+		constraintColumns := constraint.ConstraintCols
+		clear(constraintColumns[:cap(constraintColumns)])
+		*constraint = model.ConstraintInfo{ConstraintCols: constraintColumns[:0]}
+	}
+
+	foreignKeys := tableInfo.ForeignKeys
+	for _, foreignKey := range foreignKeys[:cap(foreignKeys)] {
+		if foreignKey == nil {
+			continue
+		}
+		refColumns := foreignKey.RefCols
+		columns := foreignKey.Cols
+		clear(refColumns[:cap(refColumns)])
+		clear(columns[:cap(columns)])
+		*foreignKey = model.FKInfo{
+			RefCols: refColumns[:0],
+			Cols:    columns[:0],
+		}
+	}
+
+	*tableInfo = model.TableInfo{
+		Columns:     columns,
+		Indices:     indices[:0],
+		Constraints: constraints[:0],
+		ForeignKeys: foreignKeys[:0],
+	}
+}
+
+// Close releases the persistent MetaKV scanner.
+func (i *TableInfoIterator) Close() {
+	if i.iter != nil {
+		i.iter.Close()
+		i.iter = nil
+	}
+}
+
+// RetainedMemory returns reusable capacity owned by the MetaKV scanner.
+func (i *TableInfoIterator) RetainedMemory() int64 {
+	if i.iter == nil {
+		return 0
+	}
+	return i.iter.RetainedMemory()
+}
+
 func splitRangeInt64Max(n int64) [][]string {
 	ranges := make([][]string, n)
 

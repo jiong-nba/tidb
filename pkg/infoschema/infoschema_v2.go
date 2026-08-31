@@ -1132,6 +1132,145 @@ retry:
 	return tblInfos, nil
 }
 
+// TableInfoIterator keeps one MetaKV scanner alive while table metadata is
+// consumed in multiple executor output batches.
+type TableInfoIterator interface {
+	NextInto(context.Context, *model.TableInfo) (*model.TableInfo, error)
+	RetainedMemory() int64
+	Close()
+}
+
+type infoschemaV2TableInfoIterator struct {
+	store       kv.Storage
+	ts          uint64
+	dbID        int64
+	lastTableID int64
+	iter        *meta.TableInfoIterator
+	keepAlive   func()
+	exhausted   bool
+}
+
+const metadataScanBatchSize = 32
+
+// NewTableInfoIterator creates a persistent MetaKV iterator positioned
+// strictly after exclusiveStartTableID.
+func (is *infoschemaV2) NewTableInfoIterator(
+	ctx context.Context,
+	schema ast.CIStr,
+	exclusiveStartTableID int64,
+) (TableInfoIterator, error) {
+	if IsSpecialDB(schema.L) {
+		return nil, errors.Errorf("cannot iterate special schema %s from MetaKV", schema.O)
+	}
+
+	is.keepAlive()
+	dbInfo, ok := is.SchemaByName(schema)
+	iterator := &infoschemaV2TableInfoIterator{
+		store:       is.r.Store(),
+		ts:          is.ts,
+		lastTableID: exclusiveStartTableID,
+		keepAlive:   is.keepAlive,
+		exhausted:   !ok,
+	}
+	if !ok {
+		return iterator, nil
+	}
+	iterator.dbID = dbInfo.ID
+	if err := iterator.reopen(ctx); err != nil {
+		return nil, err
+	}
+	return iterator, nil
+}
+
+func (i *infoschemaV2TableInfoIterator) reopen(ctx context.Context) error {
+	for !i.exhausted {
+		i.keepSnapshotAlive()
+		snapshot := i.store.GetSnapshot(kv.NewVersion(i.ts))
+		// Keep this consistent with SchemaTableInfos so a long metadata scan has
+		// the same bounded TiKV request timeout as the existing list API.
+		snapshot.SetOption(kv.TiKVClientReadTimeout, uint64(3000)) // 3000ms.
+		snapshot.SetOption(kv.ScanBatchSize, metadataScanBatchSize)
+		iter, err := meta.NewTableInfoIteratorFromSnapshot(
+			snapshot,
+			i.dbID,
+			i.lastTableID,
+		)
+		if err == nil {
+			i.iter = iter
+			return nil
+		}
+		if meta.ErrDBNotExists.Equal(err) {
+			i.exhausted = true
+			return nil
+		}
+		if !strings.Contains(err.Error(), "in flashback progress") {
+			return errors.Trace(err)
+		}
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (i *infoschemaV2TableInfoIterator) NextInto(ctx context.Context, destination *model.TableInfo) (*model.TableInfo, error) {
+	for !i.exhausted {
+		i.keepSnapshotAlive()
+		tableInfo, err := i.iter.NextInto(ctx, destination)
+		if err == nil {
+			if tableInfo == nil {
+				i.Close()
+				return nil, nil
+			}
+			i.lastTableID = tableInfo.ID
+			return tableInfo, nil
+		}
+
+		i.iter.Close()
+		i.iter = nil
+		if meta.ErrDBNotExists.Equal(err) {
+			i.exhausted = true
+			return nil, nil
+		}
+		if !strings.Contains(err.Error(), "in flashback progress") {
+			return nil, errors.Trace(err)
+		}
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if err := i.reopen(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+func (i *infoschemaV2TableInfoIterator) Close() {
+	if i.iter != nil {
+		i.iter.Close()
+		i.iter = nil
+	}
+	i.keepAlive = nil
+	i.exhausted = true
+}
+
+func (i *infoschemaV2TableInfoIterator) keepSnapshotAlive() {
+	if i.keepAlive != nil {
+		i.keepAlive()
+	}
+}
+
+func (i *infoschemaV2TableInfoIterator) RetainedMemory() int64 {
+	if i.iter == nil {
+		return 0
+	}
+	return i.iter.RetainedMemory()
+}
+
 // SchemaSimpleTableInfos implements MetaOnlyInfoSchema.
 func (is *infoschemaV2) SchemaSimpleTableInfos(ctx context.Context, schema ast.CIStr) ([]*model.TableNameInfo, error) {
 	if IsSpecialDB(schema.L) {

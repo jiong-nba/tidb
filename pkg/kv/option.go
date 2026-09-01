@@ -101,6 +101,9 @@ const (
 	// ScanResponseRetainedSize enables reusable scan response buffers and sets
 	// their per-scanner retained capacity limit in bytes.
 	ScanResponseRetainedSize
+	// ScanTransportBufferReuse selects a dedicated unary connection with a
+	// bounded gRPC transport buffer pool for reusable sequential scans.
+	ScanTransportBufferReuse
 	// TxnSource set the source of this transaction.
 	// We use an uint64 to represent the source of a transaction.
 	// The first 8 bits are reserved for TiCDC to implement BDR synchronization,

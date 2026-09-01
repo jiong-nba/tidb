@@ -1240,6 +1240,7 @@ func (i *infoschemaV2TableInfoIterator) reopen(ctx context.Context) error {
 		snapshot.SetOption(kv.TiKVClientReadTimeout, uint64(3000)) // 3000ms.
 		snapshot.SetOption(kv.ScanBatchSize, metadataScanBatchSize)
 		snapshot.SetOption(kv.ScanResponseRetainedSize, metadataScanResponseRetainedSize)
+		snapshot.SetOption(kv.ScanTransportBufferReuse, true)
 		iter, err := meta.NewTableInfoIteratorFromSnapshotWithDecodeMode(
 			snapshot,
 			i.dbID,

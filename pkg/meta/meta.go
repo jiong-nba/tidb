@@ -1181,13 +1181,37 @@ func (m *Mutator) IterTables(dbID int64, fn func(info *model.TableInfo) error) e
 // TableInfoIterator decodes table metadata from one persistent MetaKV scanner.
 // It must be closed when the caller stops before exhaustion.
 type TableInfoIterator struct {
-	dbID int64
-	iter *structure.HashIterator
+	dbID           int64
+	decodeMode     TableInfoDecodeMode
+	columnsDecoder columnsTableInfoDecoder
+	iter           *structure.HashIterator
 }
+
+// TableInfoDecodeMode controls how much of each TableInfo value is decoded.
+type TableInfoDecodeMode uint8
+
+const (
+	// TableInfoDecodeAll decodes the complete persisted TableInfo.
+	TableInfoDecodeAll TableInfoDecodeMode = iota
+	// TableInfoDecodeColumns decodes only fields needed by INFORMATION_SCHEMA.COLUMNS.
+	TableInfoDecodeColumns
+)
 
 // NewTableInfoIterator creates a persistent iterator positioned strictly after
 // exclusiveStartTableID.
 func (m *Mutator) NewTableInfoIterator(dbID, exclusiveStartTableID int64) (*TableInfoIterator, error) {
+	return m.NewTableInfoIteratorWithDecodeMode(dbID, exclusiveStartTableID, TableInfoDecodeAll)
+}
+
+// NewTableInfoIteratorWithDecodeMode creates a table metadata iterator with a
+// projection-aware JSON decoder.
+func (m *Mutator) NewTableInfoIteratorWithDecodeMode(
+	dbID, exclusiveStartTableID int64,
+	decodeMode TableInfoDecodeMode,
+) (*TableInfoIterator, error) {
+	if decodeMode > TableInfoDecodeColumns {
+		return nil, errors.Errorf("unknown table info decode mode %d", decodeMode)
+	}
 	dbKey := m.dbKey(dbID)
 	if err := m.checkDBExists(dbKey); err != nil {
 		return nil, errors.Trace(err)
@@ -1201,7 +1225,7 @@ func (m *Mutator) NewTableInfoIterator(dbID, exclusiveStartTableID int64) (*Tabl
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return &TableInfoIterator{dbID: dbID, iter: iter}, nil
+	return &TableInfoIterator{dbID: dbID, decodeMode: decodeMode, iter: iter}, nil
 }
 
 // NextInto decodes the next table into destination or returns nil when the
@@ -1220,8 +1244,15 @@ func (i *TableInfoIterator) NextInto(ctx context.Context, destination *model.Tab
 		var tableInfo *model.TableInfo
 		if isTable {
 			tableInfo = destination
-			resetTableInfoForJSONDecode(tableInfo)
-			if err := json.Unmarshal(i.iter.Value(), tableInfo); err != nil {
+			data := i.iter.Value()
+			var err error
+			if i.decodeMode == TableInfoDecodeColumns {
+				err = i.columnsDecoder.decode(data, tableInfo)
+			} else {
+				resetTableInfoForJSONDecode(tableInfo)
+				err = json.Unmarshal(data, tableInfo)
+			}
+			if err != nil {
 				return nil, errors.Trace(err)
 			}
 			tableInfo.DBID = i.dbID
@@ -1301,14 +1332,16 @@ func (i *TableInfoIterator) Close() {
 		i.iter.Close()
 		i.iter = nil
 	}
+	i.columnsDecoder.close()
 }
 
 // RetainedMemory returns reusable capacity owned by the MetaKV scanner.
 func (i *TableInfoIterator) RetainedMemory() int64 {
-	if i.iter == nil {
-		return 0
+	retainedMemory := i.columnsDecoder.retainedMemory()
+	if i.iter != nil {
+		retainedMemory += i.iter.RetainedMemory()
 	}
-	return i.iter.RetainedMemory()
+	return retainedMemory
 }
 
 func splitRangeInt64Max(n int64) [][]string {

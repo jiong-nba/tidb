@@ -1170,6 +1170,7 @@ type infoschemaV2TableInfoIterator struct {
 	ts          uint64
 	dbID        int64
 	lastTableID int64
+	decodeMode  meta.TableInfoDecodeMode
 	iter        *meta.TableInfoIterator
 	keepAlive   func()
 	exhausted   bool
@@ -1184,6 +1185,25 @@ func (is *infoschemaV2) NewTableInfoIterator(
 	schema ast.CIStr,
 	exclusiveStartTableID int64,
 ) (TableInfoIterator, error) {
+	return is.newTableInfoIterator(ctx, schema, exclusiveStartTableID, meta.TableInfoDecodeAll)
+}
+
+// NewColumnsTableInfoIterator creates a persistent iterator that decodes only
+// metadata needed by INFORMATION_SCHEMA.COLUMNS.
+func (is *infoschemaV2) NewColumnsTableInfoIterator(
+	ctx context.Context,
+	schema ast.CIStr,
+	exclusiveStartTableID int64,
+) (TableInfoIterator, error) {
+	return is.newTableInfoIterator(ctx, schema, exclusiveStartTableID, meta.TableInfoDecodeColumns)
+}
+
+func (is *infoschemaV2) newTableInfoIterator(
+	ctx context.Context,
+	schema ast.CIStr,
+	exclusiveStartTableID int64,
+	decodeMode meta.TableInfoDecodeMode,
+) (TableInfoIterator, error) {
 	if IsSpecialDB(schema.L) {
 		return nil, errors.Errorf("cannot iterate special schema %s from MetaKV", schema.O)
 	}
@@ -1194,6 +1214,7 @@ func (is *infoschemaV2) NewTableInfoIterator(
 		store:       is.r.Store(),
 		ts:          is.ts,
 		lastTableID: exclusiveStartTableID,
+		decodeMode:  decodeMode,
 		keepAlive:   is.keepAlive,
 		exhausted:   !ok,
 	}
@@ -1215,10 +1236,11 @@ func (i *infoschemaV2TableInfoIterator) reopen(ctx context.Context) error {
 		// the same bounded TiKV request timeout as the existing list API.
 		snapshot.SetOption(kv.TiKVClientReadTimeout, uint64(3000)) // 3000ms.
 		snapshot.SetOption(kv.ScanBatchSize, metadataScanBatchSize)
-		iter, err := meta.NewTableInfoIteratorFromSnapshot(
+		iter, err := meta.NewTableInfoIteratorFromSnapshotWithDecodeMode(
 			snapshot,
 			i.dbID,
 			i.lastTableID,
+			i.decodeMode,
 		)
 		if err == nil {
 			i.iter = iter

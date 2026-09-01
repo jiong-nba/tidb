@@ -921,26 +921,51 @@ type TableItem struct {
 // Used by executor/infoschema_reader.go to handle reading from INFORMATION_SCHEMA.TABLES.
 // If visit return false, stop the iterate process.
 func (is *infoschemaV2) IterateAllTableItems(visit func(TableItem) bool) {
-	maxv, ok := is.byName.Load().Max()
-	if !ok {
-		return
+	is.IterateAllTableItemsFrom(nil, visit)
+}
+
+// IterateAllTableItemsFrom resumes IterateAllTableItems strictly after the
+// previously returned table item. The third return value reports whether the
+// B-tree was exhausted.
+func (is *infoschemaV2) IterateAllTableItemsFrom(
+	exclusiveStart *TableItem,
+	visit func(TableItem) bool,
+) (last TableItem, hasLast bool, exhausted bool) {
+	is.keepAlive()
+	var start *tableItem
+	if exclusiveStart == nil {
+		maxv, ok := is.byName.Load().Max()
+		if !ok {
+			return TableItem{}, false, true
+		}
+		start = maxv
+	} else {
+		start = &tableItem{
+			dbName:        exclusiveStart.DBName,
+			tableName:     exclusiveStart.TableName,
+			schemaVersion: math.MinInt64,
+		}
 	}
+
 	var pivot *tableItem
-	is.byName.Load().DescendLessOrEqual(maxv, func(item *tableItem) bool {
+	stopped := false
+	is.byName.Load().DescendLessOrEqual(start, func(item *tableItem) bool {
 		if item.schemaVersion > is.schemaMetaVersion {
-			// skip MVCC version, those items are not visible to the queried schema version
 			return true
 		}
 		if pivot != nil && pivot.dbName == item.dbName && pivot.tableName == item.tableName {
-			// skip MVCC version, this db.table has been visited already
 			return true
 		}
 		pivot = item
-		if !item.tomb {
-			return visit(TableItem{DBName: item.dbName, TableName: item.tableName})
+		last = TableItem{DBName: item.dbName, TableName: item.tableName}
+		hasLast = true
+		if !item.tomb && !visit(last) {
+			stopped = true
+			return false
 		}
 		return true
 	})
+	return last, hasLast, !stopped
 }
 
 // TableIsCached checks whether the table is cached.

@@ -224,6 +224,12 @@ const (
 	indexColumnObjectSize     = int64(unsafe.Sizeof(model.IndexColumn{}))
 	constraintInfoObjectSize  = int64(unsafe.Sizeof(model.ConstraintInfo{}))
 	foreignKeyInfoObjectSize  = int64(unsafe.Sizeof(model.FKInfo{}))
+	partitionInfoObjectSize   = int64(unsafe.Sizeof(model.PartitionInfo{}))
+	partitionDefObjectSize    = int64(unsafe.Sizeof(model.PartitionDefinition{}))
+	partitionStateObjectSize  = int64(unsafe.Sizeof(model.PartitionState{}))
+	updateIndexInfoObjectSize = int64(unsafe.Sizeof(model.UpdateIndexInfo{}))
+	storageRuleObjectSize     = int64(unsafe.Sizeof(model.StorageClassTransitRule{}))
+	policyRefInfoObjectSize   = int64(unsafe.Sizeof(model.PolicyRefInfo{}))
 	cistringObjectSize        = int64(unsafe.Sizeof(ast.CIStr{}))
 	tableInfoReuseSlotSize    = int64(unsafe.Sizeof(tableInfoReuseSlot{}))
 	tableInfoTrackerThreshold = 64 << 10
@@ -364,6 +370,78 @@ func reusableTableInfoMemoryUsage(tableInfo *model.TableInfo) int64 {
 		}
 		usage += foreignKeyInfoObjectSize
 		usage += int64(cap(foreignKey.RefCols)+cap(foreignKey.Cols)) * cistringObjectSize
+	}
+	usage += reusablePartitionInfoMemoryUsage(tableInfo.Partition)
+	return usage
+}
+
+func reusablePartitionInfoMemoryUsage(partitionInfo *model.PartitionInfo) int64 {
+	if partitionInfo == nil {
+		return 0
+	}
+
+	usage := partitionInfoObjectSize + int64(len(partitionInfo.Expr)+len(partitionInfo.DDLExpr))
+	usage += cistringSliceMemoryUsage(partitionInfo.Columns)
+	usage += cistringSliceMemoryUsage(partitionInfo.DDLColumns)
+	usage += partitionDefinitionSliceMemoryUsage(partitionInfo.Definitions)
+	usage += partitionDefinitionSliceMemoryUsage(partitionInfo.AddingDefinitions)
+	usage += partitionDefinitionSliceMemoryUsage(partitionInfo.DroppingDefinitions)
+	usage += int64(cap(partitionInfo.NewPartitionIDs)+cap(partitionInfo.OriginalPartitionIDsOrder)) * size.SizeOfInt64
+	usage += int64(cap(partitionInfo.States)) * partitionStateObjectSize
+
+	updateIndexes := partitionInfo.DDLUpdateIndexes[:cap(partitionInfo.DDLUpdateIndexes)]
+	usage += int64(cap(updateIndexes)) * updateIndexInfoObjectSize
+	for _, updateIndex := range updateIndexes {
+		usage += int64(len(updateIndex.IndexName))
+	}
+	if partitionInfo.DDLChangedIndex != nil {
+		usage += size.SizeOfMap + int64(len(partitionInfo.DDLChangedIndex))*(size.SizeOfInt64+size.SizeOfBool)
+	}
+	return usage
+}
+
+func cistringSliceMemoryUsage(values []ast.CIStr) int64 {
+	values = values[:cap(values)]
+	usage := int64(cap(values)) * cistringObjectSize
+	for _, value := range values {
+		usage += int64(len(value.O) + len(value.L))
+	}
+	return usage
+}
+
+func partitionDefinitionSliceMemoryUsage(definitions []model.PartitionDefinition) int64 {
+	definitions = definitions[:cap(definitions)]
+	usage := int64(cap(definitions)) * partitionDefObjectSize
+	for i := range definitions {
+		definition := &definitions[i]
+		usage += int64(len(definition.Name.O) + len(definition.Name.L) + len(definition.Comment) + len(definition.StorageClassTier))
+
+		lessThan := definition.LessThan[:cap(definition.LessThan)]
+		usage += int64(cap(lessThan)) * size.SizeOfString
+		for _, value := range lessThan {
+			usage += int64(len(value))
+		}
+
+		inValues := definition.InValues[:cap(definition.InValues)]
+		usage += int64(cap(inValues)) * size.SizeOfSlice
+		for _, values := range inValues {
+			values = values[:cap(values)]
+			usage += int64(cap(values)) * size.SizeOfString
+			for _, value := range values {
+				usage += int64(len(value))
+			}
+		}
+
+		if definition.PlacementPolicyRef != nil {
+			usage += policyRefInfoObjectSize
+			usage += int64(len(definition.PlacementPolicyRef.Name.O) + len(definition.PlacementPolicyRef.Name.L))
+		}
+
+		transitions := definition.StorageClassTransitions[:cap(definition.StorageClassTransitions)]
+		usage += int64(cap(transitions)) * storageRuleObjectSize
+		for _, transition := range transitions {
+			usage += int64(len(transition.Tier))
+		}
 	}
 	return usage
 }

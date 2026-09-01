@@ -118,6 +118,19 @@ func TestInfoSchemaTablePredicatesUseHugeRetriever(t *testing.T) {
 	indexPlan.SetSchema(expression.NewSchema())
 	indexReader := builder.Build(indexPlan).(*MemTableReaderExec)
 	require.IsType(t, &hugeMemTableRetriever{}, indexReader.retriever)
+
+	partitionExtractor := plannercore.NewInfoSchemaPartitionsExtractor()
+	partitionExtractor.ColPredicates = map[string]set.StringSet{
+		plannercore.PartitionName: set.NewStringSet("p1"),
+	}
+	partitionPlan := physicalop.PhysicalMemTable{
+		DBName:    metadef.InformationSchemaName,
+		Table:     &model.TableInfo{Name: ast.NewCIStr(infoschema.TablePartitions)},
+		Extractor: partitionExtractor,
+	}.Init(sctx, nil, 0)
+	partitionPlan.SetSchema(expression.NewSchema())
+	partitionReader := builder.Build(partitionPlan).(*MemTableReaderExec)
+	require.IsType(t, &hugeMemTableRetriever{}, partitionReader.retriever)
 }
 
 func TestHugeMemTableRetrieverKeepsTableInfoIteratorAcrossBatches(t *testing.T) {
@@ -182,6 +195,87 @@ func TestHugeMemTableRetrieverKeepsTableInfoIteratorAcrossBatches(t *testing.T) 
 		require.Equal(t, int64(i+1), id)
 	}
 	retriever.tableInfoBatch.close()
+	require.Zero(t, tracker.BytesConsumed())
+}
+
+func TestHugeMemTableRetrieverPartitionsStayBounded(t *testing.T) {
+	const (
+		tableCount     = 400
+		partitionsEach = 3
+	)
+	partitionNames := []string{"p0", "p1", "p2"}
+	tables := make([]*model.TableInfo, 0, tableCount)
+	for tableID := int64(1); tableID <= tableCount; tableID++ {
+		definitions := make([]model.PartitionDefinition, 0, partitionsEach)
+		for partitionOffset := int64(0); partitionOffset < partitionsEach; partitionOffset++ {
+			definitions = append(definitions, model.PartitionDefinition{
+				ID:   tableID*10 + partitionOffset,
+				Name: ast.NewCIStr(partitionNames[partitionOffset]),
+			})
+		}
+		tables = append(tables, &model.TableInfo{
+			ID:   tableID,
+			Name: ast.NewCIStr("t"),
+			Partition: &model.PartitionInfo{
+				Type:        ast.PartitionTypeHash,
+				Expr:        "`c01`",
+				Enable:      true,
+				Definitions: definitions,
+			},
+		})
+	}
+
+	partitionTable := &model.TableInfo{Columns: make([]*model.ColumnInfo, 29)}
+	for offset := range partitionTable.Columns {
+		partitionTable.Columns[offset] = &model.ColumnInfo{Offset: offset}
+	}
+	outputColumns := []*model.ColumnInfo{
+		partitionTable.Columns[1],
+		partitionTable.Columns[2],
+		partitionTable.Columns[3],
+		partitionTable.Columns[5],
+		partitionTable.Columns[25],
+	}
+
+	closeCount := 0
+	tracker := memory.NewTracker(7, -1)
+	retriever := &hugeMemTableRetriever{
+		partitionsExtractor: plannercore.NewInfoSchemaPartitionsExtractor(),
+		table:               partitionTable,
+		columns:             outputColumns,
+		dbs:                 []ast.CIStr{ast.NewCIStr("test")},
+		batch:               hugeMemTableBatchSize,
+		rowBuffer:           newBoundedDatumRows(partitionTable, outputColumns, tracker, 1<<20),
+		tableInfoBatch:      newBoundedTableInfoBatch(tracker, 1<<20),
+		memTracker:          tracker,
+	}
+	retriever.newTableInfoIter = func(_ context.Context, schema ast.CIStr, exclusiveStartTableID int64) (infoschema.TableInfoIterator, error) {
+		require.Equal(t, "test", schema.L)
+		require.Zero(t, exclusiveStartTableID)
+		return &mockTableInfoIterator{tables: tables, closeCount: &closeCount}, nil
+	}
+
+	rowCount := 0
+	batchCount := 0
+	for {
+		retriever.rowBuffer.beginBatch()
+		retriever.tableInfoBatch.beginBatch()
+		err := retriever.setDataForHugePartitions(context.Background(), defaultCtx())
+		require.NoError(t, err)
+		retriever.tableInfoBatch.finishBatch()
+		rows := retriever.rowBuffer.rows()
+		if len(rows) == 0 {
+			break
+		}
+		batchCount++
+		require.LessOrEqual(t, len(rows), hugeMemTableBatchSize+partitionsEach-1)
+		rowCount += len(rows)
+	}
+
+	require.Equal(t, tableCount*partitionsEach, rowCount)
+	require.Greater(t, batchCount, 1)
+	require.Equal(t, 1, closeCount)
+	require.NoError(t, retriever.close())
 	require.Zero(t, tracker.BytesConsumed())
 }
 

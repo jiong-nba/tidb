@@ -15,7 +15,6 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -160,8 +159,6 @@ func (e *memtableRetriever) retrieve(ctx context.Context, sctx sessionctx.Contex
 			err = e.setDataFromReferConst(ctx, sctx)
 		case infoschema.TableSequences:
 			err = e.setDataFromSequences(ctx, sctx)
-		case infoschema.TablePartitions:
-			err = e.setDataFromPartitions(ctx, sctx)
 		case infoschema.TableClusterInfo:
 			err = e.dataForTiDBClusterInfo(sctx)
 		case infoschema.TableAnalyzeStatus:
@@ -1029,31 +1026,32 @@ func (e *memtableRetriever) setDataFromTiDBCheckConstraints(ctx context.Context,
 
 type hugeMemTableRetriever struct {
 	dummyCloser
-	tablesExtractor    *plannercore.InfoSchemaTablesExtractor
-	columnsExtractor   *plannercore.InfoSchemaColumnsExtractor
-	indexesExtractor   *plannercore.InfoSchemaIndexesExtractor
-	table              *model.TableInfo
-	columns            []*model.ColumnInfo
-	retrieved          bool
-	initialized        bool
-	dbs                []ast.CIStr
-	curTables          []*model.TableInfo
-	curTablesLoaded    bool
-	dbsIdx             int
-	tblIdx             int
-	viewMu             syncutil.RWMutex
-	viewSchemaMap      map[int64]*expression.Schema // table id to view schema
-	viewOutputNamesMap map[int64]types.NameSlice    // table id to view output names
-	batch              int
-	is                 infoschema.InfoSchema
-	rowBuffer          *boundedDatumRows
-	tableInfoBatch     *boundedTableInfoBatch
-	memTracker         *memory.Tracker
-	newTableInfoIter   func(context.Context, ast.CIStr, int64) (infoschema.TableInfoIterator, error)
-	tableInfoIter      infoschema.TableInfoIterator
-	tableInfoIterBytes int64
-	iterateTableItems  func(*infoschema.TableItem, func(infoschema.TableItem) bool) (infoschema.TableItem, bool, bool)
-	lastTableItem      *infoschema.TableItem
+	tablesExtractor     *plannercore.InfoSchemaTablesExtractor
+	columnsExtractor    *plannercore.InfoSchemaColumnsExtractor
+	indexesExtractor    *plannercore.InfoSchemaIndexesExtractor
+	partitionsExtractor *plannercore.InfoSchemaPartitionsExtractor
+	table               *model.TableInfo
+	columns             []*model.ColumnInfo
+	retrieved           bool
+	initialized         bool
+	dbs                 []ast.CIStr
+	curTables           []*model.TableInfo
+	curTablesLoaded     bool
+	dbsIdx              int
+	tblIdx              int
+	viewMu              syncutil.RWMutex
+	viewSchemaMap       map[int64]*expression.Schema // table id to view schema
+	viewOutputNamesMap  map[int64]types.NameSlice    // table id to view output names
+	batch               int
+	is                  infoschema.InfoSchema
+	rowBuffer           *boundedDatumRows
+	tableInfoBatch      *boundedTableInfoBatch
+	memTracker          *memory.Tracker
+	newTableInfoIter    func(context.Context, ast.CIStr, int64) (infoschema.TableInfoIterator, error)
+	tableInfoIter       infoschema.TableInfoIterator
+	tableInfoIterBytes  int64
+	iterateTableItems   func(*infoschema.TableItem, func(infoschema.TableItem) bool) (infoschema.TableItem, bool, bool)
+	lastTableItem       *infoschema.TableItem
 }
 
 // retrieve implements the infoschemaRetriever interface
@@ -1096,6 +1094,8 @@ func (e *hugeMemTableRetriever) retrieve(ctx context.Context, sctx sessionctx.Co
 		err = e.setDataForColumns(ctx, sctx)
 	case infoschema.TableTiDBIndexes:
 		err = e.setDataForHugeIndexes(ctx, sctx)
+	case infoschema.TablePartitions:
+		err = e.setDataForHugePartitions(ctx, sctx)
 	}
 	if err != nil {
 		e.tableInfoBatch.finishBatch()
@@ -1152,6 +1152,8 @@ func (e *hugeMemTableRetriever) baseExtractor() *plannercore.InfoSchemaBaseExtra
 		return e.tablesExtractor.GetBase()
 	case e.columnsExtractor != nil:
 		return e.columnsExtractor.GetBase()
+	case e.partitionsExtractor != nil:
+		return e.partitionsExtractor.GetBase()
 	default:
 		return e.indexesExtractor.GetBase()
 	}
@@ -1916,194 +1918,240 @@ func (e *hugeMemTableRetriever) appendHugeIndexRows(schema ast.CIStr, table *mod
 	}
 }
 
+func (e *hugeMemTableRetriever) matchingPartitionRows(table *model.TableInfo) int {
+	partitionInfo := table.GetPartitionInfo()
+	if partitionInfo == nil {
+		if e.partitionsExtractor.HasPartitionPred() || e.partitionsExtractor.HasPartitionIDPred() {
+			return 0
+		}
+		return 1
+	}
+
+	count := 0
+	for _, definition := range partitionInfo.Definitions {
+		if e.partitionsExtractor.HasPartition(definition.Name.L) && e.partitionsExtractor.HasPartitionID(definition.ID) {
+			count++
+		}
+	}
+	return count
+}
+
+func (e *hugeMemTableRetriever) setDataForHugePartitions(ctx context.Context, sctx sessionctx.Context) error {
+	checker := privilege.GetPrivilegeManager(sctx)
+	batchTables := make([]*model.TableInfo, 0, e.batch)
+	batchSchemas := make([]ast.CIStr, 0, e.batch)
+	plannedRows := 0
+	err := e.iterateTables(ctx, func(schema ast.CIStr, table *model.TableInfo) (bool, bool) {
+		if checker != nil && !checker.RequestVerification(sctx.GetSessionVars().ActiveRoles, schema.L, table.Name.L, "", mysql.SelectPriv) {
+			return true, false
+		}
+		matchingRows := e.matchingPartitionRows(table)
+		if matchingRows == 0 {
+			return true, false
+		}
+		batchTables = append(batchTables, table)
+		batchSchemas = append(batchSchemas, schema)
+		plannedRows += matchingRows
+		return plannedRows < e.batch, true
+	})
+	if err != nil {
+		return err
+	}
+
+	statsReady := tableStatsCacheRequired(e.columns)
+	if statsReady {
+		updateTableStatsCache(sctx, batchTables)
+	}
+	for i, table := range batchTables {
+		if err := e.appendHugePartitionRows(batchSchemas[i], table, statsReady); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *hugeMemTableRetriever) appendHugePartitionRows(
+	schema ast.CIStr,
+	table *model.TableInfo,
+	statsReady bool,
+) error {
+	var createTime any
+	if e.rowBuffer.projects(18) {
+		createTime = types.NewTime(types.FromGoTime(table.GetUpdateTime()), mysql.TypeDatetime, types.DefaultFsp)
+	}
+	var affinity any
+	if e.rowBuffer.projects(27) && table.Affinity != nil {
+		affinity = table.Affinity.Level
+	}
+
+	partitionInfo := table.GetPartitionInfo()
+	if partitionInfo == nil {
+		var rowCount, avgRowLength, dataLength, indexLength any
+		if statsReady {
+			rows := cache.TableRowStatsCache.GetTableRows(table.ID)
+			data, index := cache.TableRowStatsCache.GetDataAndIndexLength(table, table.ID, rows)
+			rowCount = rows
+			dataLength = data
+			indexLength = index
+			if rows != 0 {
+				avgRowLength = data / rows
+			} else {
+				avgRowLength = uint64(0)
+			}
+		}
+		e.rowBuffer.appendProjected(
+			infoschema.CatalogVal, // TABLE_CATALOG
+			schema.O,              // TABLE_SCHEMA
+			table.Name.O,          // TABLE_NAME
+			nil,                   // PARTITION_NAME
+			nil,                   // SUBPARTITION_NAME
+			nil,                   // PARTITION_ORDINAL_POSITION
+			nil,                   // SUBPARTITION_ORDINAL_POSITION
+			nil,                   // PARTITION_METHOD
+			nil,                   // SUBPARTITION_METHOD
+			nil,                   // PARTITION_EXPRESSION
+			nil,                   // SUBPARTITION_EXPRESSION
+			nil,                   // PARTITION_DESCRIPTION
+			rowCount,              // TABLE_ROWS
+			avgRowLength,          // AVG_ROW_LENGTH
+			dataLength,            // DATA_LENGTH
+			nil,                   // MAX_DATA_LENGTH
+			indexLength,           // INDEX_LENGTH
+			nil,                   // DATA_FREE
+			createTime,            // CREATE_TIME
+			nil,                   // UPDATE_TIME
+			nil,                   // CHECK_TIME
+			nil,                   // CHECKSUM
+			nil,                   // PARTITION_COMMENT
+			nil,                   // NODEGROUP
+			nil,                   // TABLESPACE_NAME
+			nil,                   // TIDB_PARTITION_ID
+			nil,                   // TIDB_PLACEMENT_POLICY_NAME
+			affinity,              // TIDB_AFFINITY
+			nil,                   // TIDB_STORAGE_CLASS
+		)
+		return nil
+	}
+
+	partitionMethod := partitionInfo.Type.String()
+	partitionExpr := partitionInfo.Expr
+	if len(partitionInfo.Columns) > 0 {
+		switch partitionInfo.Type {
+		case ast.PartitionTypeRange:
+			partitionMethod = "RANGE COLUMNS"
+		case ast.PartitionTypeList:
+			partitionMethod = "LIST COLUMNS"
+		case ast.PartitionTypeKey:
+			partitionMethod = "KEY"
+		default:
+			return errors.Errorf("Inconsistent partition type, have type %v, but with COLUMNS > 0 (%d)", partitionInfo.Type, len(partitionInfo.Columns))
+		}
+		if e.rowBuffer.projects(9) {
+			var builder strings.Builder
+			for i, column := range partitionInfo.Columns {
+				if i > 0 {
+					builder.WriteByte(',')
+				}
+				builder.WriteByte('`')
+				builder.WriteString(column.String())
+				builder.WriteByte('`')
+			}
+			partitionExpr = builder.String()
+		}
+	}
+
+	for i, definition := range partitionInfo.Definitions {
+		if !e.partitionsExtractor.HasPartition(definition.Name.L) || !e.partitionsExtractor.HasPartitionID(definition.ID) {
+			continue
+		}
+
+		var rowCount, avgRowLength, dataLength, indexLength any
+		if statsReady {
+			rows := cache.TableRowStatsCache.GetTableRows(definition.ID)
+			data, index := cache.TableRowStatsCache.GetDataAndIndexLength(table, definition.ID, rows)
+			rowCount = rows
+			dataLength = data
+			indexLength = index
+			avgRowLength = uint64(0)
+			if rows != 0 {
+				avgRowLength = data / rows
+			}
+		}
+
+		var partitionDesc any = ""
+		if e.rowBuffer.projects(11) {
+			switch partitionInfo.Type {
+			case ast.PartitionTypeRange:
+				partitionDesc = strings.Join(definition.LessThan, ",")
+			case ast.PartitionTypeList:
+				if len(definition.InValues) > 0 {
+					var builder strings.Builder
+					for i, values := range definition.InValues {
+						if i > 0 {
+							builder.WriteByte(',')
+						}
+						if len(values) != 1 {
+							builder.WriteByte('(')
+						}
+						builder.WriteString(strings.Join(values, ","))
+						if len(values) != 1 {
+							builder.WriteByte(')')
+						}
+					}
+					partitionDesc = builder.String()
+				}
+			}
+		}
+
+		var policyName any
+		if e.rowBuffer.projects(26) && definition.PlacementPolicyRef != nil {
+			policyName = definition.PlacementPolicyRef.Name.O
+		}
+		var storageClass any
+		if e.rowBuffer.projects(28) {
+			storageClass = definition.StorageClassString()
+		}
+		e.rowBuffer.appendProjected(
+			infoschema.CatalogVal, // TABLE_CATALOG
+			schema.O,              // TABLE_SCHEMA
+			table.Name.O,          // TABLE_NAME
+			definition.Name.O,     // PARTITION_NAME
+			nil,                   // SUBPARTITION_NAME
+			i+1,                   // PARTITION_ORDINAL_POSITION
+			nil,                   // SUBPARTITION_ORDINAL_POSITION
+			partitionMethod,       // PARTITION_METHOD
+			nil,                   // SUBPARTITION_METHOD
+			partitionExpr,         // PARTITION_EXPRESSION
+			nil,                   // SUBPARTITION_EXPRESSION
+			partitionDesc,         // PARTITION_DESCRIPTION
+			rowCount,              // TABLE_ROWS
+			avgRowLength,          // AVG_ROW_LENGTH
+			dataLength,            // DATA_LENGTH
+			uint64(0),             // MAX_DATA_LENGTH
+			indexLength,           // INDEX_LENGTH
+			uint64(0),             // DATA_FREE
+			createTime,            // CREATE_TIME
+			nil,                   // UPDATE_TIME
+			nil,                   // CHECK_TIME
+			nil,                   // CHECKSUM
+			definition.Comment,    // PARTITION_COMMENT
+			nil,                   // NODEGROUP
+			nil,                   // TABLESPACE_NAME
+			definition.ID,         // TIDB_PARTITION_ID
+			policyName,            // TIDB_PLACEMENT_POLICY_NAME
+			affinity,              // TIDB_AFFINITY
+			storageClass,          // TIDB_STORAGE_CLASS
+		)
+	}
+	return nil
+}
+
 func calcCharOctLength(lenInChar int, cs string) int {
 	lenInBytes := lenInChar
 	if desc, err := charset.GetCharsetInfo(cs); err == nil {
 		lenInBytes = desc.Maxlen * lenInChar
 	}
 	return lenInBytes
-}
-
-func (e *memtableRetriever) setDataFromPartitions(ctx context.Context, sctx sessionctx.Context) error {
-	checker := privilege.GetPrivilegeManager(sctx)
-	var rows [][]types.Datum
-	createTimeTp := mysql.TypeDatetime
-
-	ex, ok := e.extractor.(*plannercore.InfoSchemaPartitionsExtractor)
-	if !ok {
-		return errors.Errorf("wrong extractor type: %T, expected InfoSchemaPartitionsExtractor", e.extractor)
-	}
-	if ex.SkipRequest {
-		return nil
-	}
-	schemas, tables, err := ex.ListSchemasAndTables(ctx, e.is)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	e.updateStatsCacheIfNeed(sctx, tables)
-	for i, table := range tables {
-		schema := schemas[i]
-		if checker != nil && !checker.RequestVerification(sctx.GetSessionVars().ActiveRoles, schema.L, table.Name.L, "", mysql.SelectPriv) {
-			continue
-		}
-		createTime := types.NewTime(types.FromGoTime(table.GetUpdateTime()), createTimeTp, types.DefaultFsp)
-
-		if ctx.Err() != nil {
-			return errors.Trace(ctx.Err())
-		}
-
-		var affinity any
-		if info := table.Affinity; info != nil {
-			affinity = info.Level
-		}
-
-		var rowCount, dataLength, indexLength uint64
-		if table.GetPartitionInfo() == nil {
-			rowCount = cache.TableRowStatsCache.GetTableRows(table.ID)
-			dataLength, indexLength = cache.TableRowStatsCache.GetDataAndIndexLength(table, table.ID, rowCount)
-			avgRowLength := uint64(0)
-			if rowCount != 0 {
-				avgRowLength = dataLength / rowCount
-			}
-			// If there are any conditions on PARTITION_NAME or TIDB_PARTITION_ID in the extractor, this record should be ignored.
-			if ex.HasPartitionPred() || ex.HasPartitionIDPred() {
-				continue
-			}
-			record := types.MakeDatums(
-				infoschema.CatalogVal, // TABLE_CATALOG
-				schema.O,              // TABLE_SCHEMA
-				table.Name.O,          // TABLE_NAME
-				nil,                   // PARTITION_NAME
-				nil,                   // SUBPARTITION_NAME
-				nil,                   // PARTITION_ORDINAL_POSITION
-				nil,                   // SUBPARTITION_ORDINAL_POSITION
-				nil,                   // PARTITION_METHOD
-				nil,                   // SUBPARTITION_METHOD
-				nil,                   // PARTITION_EXPRESSION
-				nil,                   // SUBPARTITION_EXPRESSION
-				nil,                   // PARTITION_DESCRIPTION
-				rowCount,              // TABLE_ROWS
-				avgRowLength,          // AVG_ROW_LENGTH
-				dataLength,            // DATA_LENGTH
-				nil,                   // MAX_DATA_LENGTH
-				indexLength,           // INDEX_LENGTH
-				nil,                   // DATA_FREE
-				createTime,            // CREATE_TIME
-				nil,                   // UPDATE_TIME
-				nil,                   // CHECK_TIME
-				nil,                   // CHECKSUM
-				nil,                   // PARTITION_COMMENT
-				nil,                   // NODEGROUP
-				nil,                   // TABLESPACE_NAME
-				nil,                   // TIDB_PARTITION_ID
-				nil,                   // TIDB_PLACEMENT_POLICY_NAME
-				affinity,              // TIDB_AFFINITY
-				nil,                   // TIDB_STORAGE_CLASS
-			)
-			rows = append(rows, record)
-			e.recordMemoryConsume(record)
-		} else {
-			for i, pi := range table.GetPartitionInfo().Definitions {
-				if !ex.HasPartition(pi.Name.L) || !ex.HasPartitionID(pi.ID) {
-					continue
-				}
-				rowCount = cache.TableRowStatsCache.GetTableRows(pi.ID)
-				dataLength, indexLength = cache.TableRowStatsCache.GetDataAndIndexLength(table, pi.ID, rowCount)
-				avgRowLength := uint64(0)
-				if rowCount != 0 {
-					avgRowLength = dataLength / rowCount
-				}
-
-				var partitionDesc string
-				if table.Partition.Type == ast.PartitionTypeRange {
-					partitionDesc = strings.Join(pi.LessThan, ",")
-				} else if table.Partition.Type == ast.PartitionTypeList {
-					if len(pi.InValues) > 0 {
-						buf := bytes.NewBuffer(nil)
-						for i, vs := range pi.InValues {
-							if i > 0 {
-								buf.WriteString(",")
-							}
-							if len(vs) != 1 {
-								buf.WriteString("(")
-							}
-							buf.WriteString(strings.Join(vs, ","))
-							if len(vs) != 1 {
-								buf.WriteString(")")
-							}
-						}
-						partitionDesc = buf.String()
-					}
-				}
-
-				partitionMethod := table.Partition.Type.String()
-				partitionExpr := table.Partition.Expr
-				if len(table.Partition.Columns) > 0 {
-					switch table.Partition.Type {
-					case ast.PartitionTypeRange:
-						partitionMethod = "RANGE COLUMNS"
-					case ast.PartitionTypeList:
-						partitionMethod = "LIST COLUMNS"
-					case ast.PartitionTypeKey:
-						partitionMethod = "KEY"
-					default:
-						return errors.Errorf("Inconsistent partition type, have type %v, but with COLUMNS > 0 (%d)", table.Partition.Type, len(table.Partition.Columns))
-					}
-					buf := bytes.NewBuffer(nil)
-					for i, col := range table.Partition.Columns {
-						if i > 0 {
-							buf.WriteString(",")
-						}
-						buf.WriteString("`")
-						buf.WriteString(col.String())
-						buf.WriteString("`")
-					}
-					partitionExpr = buf.String()
-				}
-
-				var policyName any
-				if pi.PlacementPolicyRef != nil {
-					policyName = pi.PlacementPolicyRef.Name.O
-				}
-				storageClass := pi.StorageClassString()
-				record := types.MakeDatums(
-					infoschema.CatalogVal, // TABLE_CATALOG
-					schema.O,              // TABLE_SCHEMA
-					table.Name.O,          // TABLE_NAME
-					pi.Name.O,             // PARTITION_NAME
-					nil,                   // SUBPARTITION_NAME
-					i+1,                   // PARTITION_ORDINAL_POSITION
-					nil,                   // SUBPARTITION_ORDINAL_POSITION
-					partitionMethod,       // PARTITION_METHOD
-					nil,                   // SUBPARTITION_METHOD
-					partitionExpr,         // PARTITION_EXPRESSION
-					nil,                   // SUBPARTITION_EXPRESSION
-					partitionDesc,         // PARTITION_DESCRIPTION
-					rowCount,              // TABLE_ROWS
-					avgRowLength,          // AVG_ROW_LENGTH
-					dataLength,            // DATA_LENGTH
-					uint64(0),             // MAX_DATA_LENGTH
-					indexLength,           // INDEX_LENGTH
-					uint64(0),             // DATA_FREE
-					createTime,            // CREATE_TIME
-					nil,                   // UPDATE_TIME
-					nil,                   // CHECK_TIME
-					nil,                   // CHECKSUM
-					pi.Comment,            // PARTITION_COMMENT
-					nil,                   // NODEGROUP
-					nil,                   // TABLESPACE_NAME
-					pi.ID,                 // TIDB_PARTITION_ID
-					policyName,            // TIDB_PLACEMENT_POLICY_NAME
-					affinity,              // TIDB_AFFINITY
-					storageClass,          // TIDB_STORAGE_CLASS
-				)
-				rows = append(rows, record)
-				e.recordMemoryConsume(record)
-			}
-		}
-	}
-	e.rows = rows
-	return nil
 }
 
 func (e *memtableRetriever) setDataFromIndexes(ctx context.Context, sctx sessionctx.Context) error {

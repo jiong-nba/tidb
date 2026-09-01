@@ -2587,7 +2587,6 @@ func (b *executorBuilder) buildMemTable(v *physicalop.PhysicalMemTable) exec.Exe
 			strings.ToLower(infoschema.TableViews),
 			strings.ToLower(infoschema.TableReferConst),
 			strings.ToLower(infoschema.TableSequences),
-			strings.ToLower(infoschema.TablePartitions),
 			strings.ToLower(infoschema.TableEngines),
 			strings.ToLower(infoschema.TableCollations),
 			strings.ToLower(infoschema.TableAnalyzeStatus),
@@ -2689,7 +2688,8 @@ func (b *executorBuilder) buildMemTable(v *physicalop.PhysicalMemTable) exec.Exe
 			}
 		case strings.ToLower(infoschema.TableTables),
 			strings.ToLower(infoschema.TableColumns),
-			strings.ToLower(infoschema.TableTiDBIndexes):
+			strings.ToLower(infoschema.TableTiDBIndexes),
+			strings.ToLower(infoschema.TablePartitions):
 			memTracker := memory.NewTracker(v.ID(), -1)
 			memTracker.AttachTo(b.sctx.GetSessionVars().StmtCtx.MemTracker)
 			retriever := &hugeMemTableRetriever{
@@ -2706,6 +2706,8 @@ func (b *executorBuilder) buildMemTable(v *physicalop.PhysicalMemTable) exec.Exe
 				retriever.viewOutputNamesMap = make(map[int64]types.NameSlice)
 			case strings.ToLower(infoschema.TableTiDBIndexes):
 				retriever.indexesExtractor = v.Extractor.(*plannercore.InfoSchemaIndexesExtractor)
+			case strings.ToLower(infoschema.TablePartitions):
+				retriever.partitionsExtractor = v.Extractor.(*plannercore.InfoSchemaPartitionsExtractor)
 			}
 			return &MemTableReaderExec{
 				BaseExecutor: exec.NewBaseExecutor(b.sctx, v.Schema(), v.ID()),

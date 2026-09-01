@@ -120,4 +120,21 @@ func TestBoundedDatumRows(t *testing.T) {
 		require.Zero(t, tracker.BytesConsumed())
 	})
 
+	t.Run("account partition metadata", func(t *testing.T) {
+		baseUsage := reusableTableInfoMemoryUsage(&model.TableInfo{})
+		partitionedUsage := reusableTableInfoMemoryUsage(&model.TableInfo{
+			Partition: &model.PartitionInfo{
+				Expr: "c01",
+				Definitions: []model.PartitionDefinition{
+					{
+						LessThan: []string{"100"},
+						InValues: [][]string{{"1", "2"}},
+						Comment:  "partition comment",
+					},
+				},
+			},
+		})
+		require.Greater(t, partitionedUsage, baseUsage)
+	})
+
 }
